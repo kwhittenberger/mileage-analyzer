@@ -1,0 +1,162 @@
+================================================================================
+QUICK START GUIDE - Mileage Analysis Tool
+D'Ewart Representatives, L.L.C.
+================================================================================
+
+EASIEST WAY TO RUN
+------------------
+1. Double-click: run_mileage_analysis.bat
+2. Choose whether to enable business lookup (Y/N)
+3. Wait for analysis to complete
+4. Review the text report that opens automatically
+
+OUTPUT FILES GENERATED
+---------------------
+After running, you'll have these files:
+
+1. mileage_report.txt
+   - Full text report for your records
+   - Detailed breakdown by week and trip
+
+2. weekly_summary.csv (OPEN THIS IN EXCEL!)
+   - Perfect for creating charts
+   - Shows commute, business, and personal miles by week
+   - Use Excel's chart wizard to visualize trends
+
+3. detailed_trips.csv (OPEN THIS IN EXCEL!)
+   - Every single trip with full details
+   - Filter by category to see only business trips
+   - Sort by distance, date, or business name
+   - Great for finding specific trips for documentation
+
+4. summary.csv (OPEN THIS IN EXCEL!)
+   - Quick overview of totals
+   - Business vs personal percentages
+   - Use for tax reporting summary
+
+
+WHAT TO DO WITH THE CSV FILES
+------------------------------
+
+FOR WEEKLY REPORTS:
+1. Open weekly_summary.csv in Excel
+2. Select the data (excluding TOTAL row)
+3. Insert > Chart > Column Chart
+4. You now have a visual weekly mileage report!
+
+FOR TAX DOCUMENTATION:
+1. Open detailed_trips.csv in Excel
+2. Click on "Category" column header
+3. Use Filter > Select "Business"
+4. Now you see only business trips with business names
+5. Print or save as PDF for tax records
+
+FOR FINDING SPECIFIC TRIPS:
+1. Open detailed_trips.csv in Excel
+2. Use Ctrl+F to search for:
+   - Specific dates
+   - Specific addresses
+   - Specific business names
+3. Check the "Distance" and "Category" columns
+
+
+BUSINESS LOOKUP FEATURE
+-----------------------
+The tool uses TWO methods to identify businesses:
+
+METHOD 1 - AUTOMATIC LOOKUP (when you choose Y):
+- Finds gas stations, restaurants, stores automatically
+- Uses free OpenStreetMap data
+- Takes ~1 second per new address
+- Results are cached for speed
+
+METHOD 2 - MANUAL MAPPING (always available):
+- For customer sites and regular business locations
+- Edit business_mapping.json file to add known businesses
+- Example entry:
+  "18524 NE 191st St, Woodinville": "Customer ABC - Main Office"
+
+HOW TO ADD MANUAL BUSINESS NAMES:
+1. Open business_mapping.json in Notepad
+2. Add a line after the last entry:
+   "ADDRESS": "BUSINESS NAME",
+3. Save the file
+4. Re-run the analysis
+
+TIPS:
+- Manual mappings are checked FIRST (fastest)
+- Add your frequent customer locations once
+- Automatic lookup handles gas stations, restaurants, etc.
+- Run with lookup on first time, then cached for speed
+
+RECOMMENDATION FOR BEST RESULTS:
+1. Set up Google Places API (one-time, 10 mins - see GOOGLE_API_SETUP.txt)
+   - Gets accurate names for offices, warehouses, all business types
+   - FREE for typical use ($200/month credit)
+   - Fast lookups (~300ms each)
+
+2. Run analysis with lookup enabled (Y)
+   - Automatically finds most business names
+   - Results are cached for speed
+
+3. Review detailed_trips.csv for any remaining street addresses
+   - Add these to business_mapping.json with custom names
+
+4. Future runs use cached + manual entries (instant!)
+
+QUICK START (without Google API):
+1. First run: Enable lookup (Y) - uses OpenStreetMap (slower but free)
+2. Check CSV for addresses that need names
+3. Add to business_mapping.json
+4. Re-run (fast with cache)
+
+
+COMMON TASKS
+------------
+
+Task: "I need to see all my Whidbey Island business trips"
+1. Open detailed_trips.csv in Excel
+2. Use AutoFilter (Data > Filter)
+3. Filter "Category" = Business
+4. Filter "Start Address" or "End Address" contains "Whidbey"
+
+Task: "I need total business miles for this quarter"
+1. Open detailed_trips.csv in Excel
+2. Filter "Category" = Business
+3. Filter "Date" for your quarter
+4. Look at bottom of "Distance" column for sum
+   (or use =SUM() formula)
+
+Task: "I want to see my commute pattern"
+1. Open weekly_summary.csv in Excel
+2. Look at "Commute Miles" column
+3. Create a line chart to see trends
+
+Task: "I need proof of business miles for audit"
+1. Open detailed_trips.csv in Excel
+2. Filter "Category" = Business
+3. Print the filtered results
+4. Include the summary.csv totals as a cover sheet
+
+
+TIPS & TRICKS
+-------------
+
+1. Keep your CSV files - they're easier to work with than text reports
+2. Create a backup before filtering/editing CSV files
+3. Use Excel's "Save As" to save filtered views as separate files
+4. The "Week Starting" column in detailed_trips.csv helps group trips
+5. Business names are only filled in for "Business" category trips
+
+
+NEED MORE HELP?
+---------------
+See README.txt for complete documentation.
+
+Questions? Contact:
+Doug D'Ewart
+doug@dewart.com
+Office: 425.485.6545
+Cell: 206.510.9692
+
+================================================================================

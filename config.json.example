@@ -1,0 +1,9 @@
+{
+  "_comment": "========== CONFIGURATION FILE ==========",
+  "_instructions": "Copy this file to config.json and add your Google API key below",
+  "_how_to_get_api_key": "See GOOGLE_API_SETUP.txt for step-by-step instructions",
+  "_free_tier": "Google provides $200/month free credit",
+  "_apis_needed": "Enable 'Maps JavaScript API' and 'Places API (New)' in Google Cloud Console",
+
+  "google_places_api_key": "YOUR_API_KEY_HERE"
+}

@@ -1,0 +1,202 @@
+================================================================================
+GOOGLE PLACES API SETUP GUIDE
+Enhanced Business Lookup for Mileage Analysis Tool
+================================================================================
+
+OVERVIEW
+--------
+Google Places API provides significantly better business name lookup compared
+to the free OpenStreetMap service. This guide walks you through setting it up.
+
+BENEFITS:
+✓ Much more accurate business names (offices, warehouses, business parks)
+✓ Faster lookups (~300ms vs 1-1.5 seconds)
+✓ Better coverage of commercial properties
+✓ Stays FREE for most users ($200/month credit = ~11,000 lookups)
+
+TIME REQUIRED: 10-15 minutes (one-time setup)
+
+
+STEP-BY-STEP INSTRUCTIONS
+==========================
+
+STEP 1: CREATE GOOGLE CLOUD ACCOUNT
+------------------------------------
+1. Go to: https://console.cloud.google.com
+2. Click "Get started for free" or "Try for free"
+3. Sign in with your Google account (or create one)
+4. Follow the prompts to set up billing
+   - Don't worry! You get $200 FREE credit every month
+   - You won't be charged unless you use more than $200/month
+   - For typical use (100-500 addresses/month), you'll NEVER be charged
+
+
+STEP 2: CREATE A NEW PROJECT
+-----------------------------
+1. In Google Cloud Console, click the project dropdown (top bar)
+2. Click "New Project"
+3. Name it: "Mileage Tracker" (or whatever you prefer)
+4. Click "Create"
+5. Wait for the project to be created (~10 seconds)
+6. Select your new project from the dropdown
+
+
+STEP 3: ENABLE PLACES API
+--------------------------
+1. In the left menu, go to: "APIs & Services" > "Library"
+2. Search for: "Places API"
+3. Click on "Places API" (not "Places API (New)")
+4. Click the blue "ENABLE" button
+5. Wait for it to enable (~5 seconds)
+
+
+STEP 4: CREATE API KEY
+-----------------------
+1. In the left menu, go to: "APIs & Services" > "Credentials"
+2. Click "+ CREATE CREDENTIALS" at the top
+3. Select "API Key"
+4. A popup will show your API key - COPY IT!
+5. Click "RESTRICT KEY" (important for security)
+
+
+STEP 5: RESTRICT YOUR API KEY (Security)
+-----------------------------------------
+1. Under "Application restrictions":
+   - Select "IP addresses"
+   - Click "ADD AN ITEM"
+   - Enter: 0.0.0.0/0 (allows from your computer)
+
+2. Under "API restrictions":
+   - Select "Restrict key"
+   - Check ONLY "Places API"
+
+3. Click "SAVE" at the bottom
+
+
+STEP 6: ADD KEY TO MILEAGE TOOL
+--------------------------------
+1. Open the file: config.json (in your mileage tool folder)
+2. Find the line: "google_places_api_key": ""
+3. Paste your API key between the quotes:
+   "google_places_api_key": "AIzaSyD-your-actual-key-here"
+4. Save the file
+
+
+STEP 7: TEST IT!
+----------------
+1. Run the analysis with lookup enabled:
+   python analyze_mileage.py volvo-trips-log.csv --lookup
+
+2. You should see:
+   "Using: Google Places API"
+
+3. Check the output CSV - business names should be much better!
+
+
+TROUBLESHOOTING
+===============
+
+Problem: "Using: OpenStreetMap" instead of Google Places API
+Solution:
+  - Check that your API key is correctly pasted in config.json
+  - Make sure there are quotes around the key
+  - No extra spaces before or after the key
+  - The file must be named exactly: config.json
+
+Problem: No results or errors
+Solution:
+  - Go back to Google Cloud Console
+  - Check that "Places API" is enabled
+  - Check that your API key is not restricted to specific IPs that exclude you
+  - Try creating a new API key
+
+Problem: "This API project is not authorized to use this API"
+Solution:
+  - Wait 2-5 minutes after enabling the API
+  - Sometimes takes a moment to propagate
+  - If still not working, disable and re-enable Places API
+
+
+COST BREAKDOWN
+==============
+
+FREE TIER:
+- $200 credit every month (resets monthly)
+- Covers ~11,000 place lookups per month
+- More than enough for typical use
+
+PRICING (after free tier):
+- $17 per 1,000 requests
+- So $200 credit = 11,764 requests free per month
+
+TYPICAL USAGE:
+- First run: Maybe 200-500 unique addresses
+- Monthly updates: Maybe 10-50 new addresses
+- Cached results mean no repeat lookups
+- You'll likely NEVER exceed the free tier
+
+EXAMPLE:
+If you have 500 trips per month with 100 unique business addresses:
+- First month: 100 lookups = $1.70 (FREE - covered by $200 credit)
+- Next months: 10 new addresses = $0.17 (FREE - covered by $200 credit)
+
+
+MONITORING USAGE
+================
+
+To check your API usage:
+1. Go to: https://console.cloud.google.com
+2. Select your project
+3. Go to: "APIs & Services" > "Dashboard"
+4. Click on "Places API"
+5. View usage charts
+
+
+SECURITY BEST PRACTICES
+========================
+
+✓ DO restrict your API key to only "Places API"
+✓ DO monitor your usage periodically
+✓ DO keep your API key private (don't share it)
+✓ DO keep config.json in a secure location
+
+✗ DON'T share your API key publicly
+✗ DON'T commit config.json to public repositories
+✗ DON'T remove API restrictions
+
+
+ALTERNATIVE: STAYING WITH FREE OPTION
+======================================
+
+If you prefer not to set up Google Places API, the tool still works with
+OpenStreetMap (free, no API key needed):
+
+1. Just use --lookup without adding an API key
+2. It will use OpenStreetMap automatically
+3. Still finds gas stations, restaurants, stores
+4. Add custom names to business_mapping.json for others
+
+
+GETTING HELP
+============
+
+If you run into issues:
+1. Check this guide again carefully
+2. Google Cloud Console has extensive documentation
+3. Common issues are usually typos in the API key
+
+The setup is worth it - business names will be much more accurate!
+
+
+================================================================================
+QUICK REFERENCE
+================================================================================
+
+1. Google Cloud Console: https://console.cloud.google.com
+2. Enable Places API: APIs & Services > Library > "Places API" > Enable
+3. Create API Key: APIs & Services > Credentials > Create Credentials > API Key
+4. Restrict Key: IP addresses (0.0.0.0/0) + API restrictions (Places API only)
+5. Add to config.json: "google_places_api_key": "YOUR-KEY-HERE"
+6. Run: python analyze_mileage.py volvo-trips-log.csv --lookup
+
+================================================================================

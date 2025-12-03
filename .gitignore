@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# Sensitive/personal data
+config.json
+address_cache.json
+business_mapping.json
+
+# Data files (user-specific)
+*.csv
+*.xlsx
+*.msg
+mileage_report.txt
+
+# Portable distribution (contains exe and user data)
+MileageAnalyzer_Portable/
+
+# IDE and tools
+.vscode/
+.idea/
+.claude/
