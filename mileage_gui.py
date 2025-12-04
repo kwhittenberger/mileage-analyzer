@@ -3961,6 +3961,10 @@ class MileageAnalyzerGUI(QMainWindow):
         self.end_date.setDate(QDate.currentDate())
         layout.addWidget(self.end_date)
 
+        # Connect date changes to re-run analysis (if a file is loaded)
+        self.start_date.dateChanged.connect(self._on_date_range_changed)
+        self.end_date.dateChanged.connect(self._on_date_range_changed)
+
         # Business lookup checkbox - default to enabled for automatic lookup
         self.lookup_checkbox = QCheckBox("Enable Business Lookup")
         self.lookup_checkbox.setChecked(True)  # Enable by default
@@ -4053,6 +4057,12 @@ class MileageAnalyzerGUI(QMainWindow):
             self.status_bar.showMessage(f"Loading: {os.path.basename(file_path)}...")
             # First load trips quickly without lookup, then auto-start lookup
             self._run_analysis(enable_lookup=False, auto_continue=True)
+
+    def _on_date_range_changed(self):
+        """Re-run analysis when date range is changed (if a file is loaded)"""
+        if self.current_file:
+            # Re-filter with current lookup setting, no auto-continue
+            self._run_analysis()
 
     def _run_analysis(self, enable_lookup=None, auto_continue=False):
         """Run the mileage analysis
