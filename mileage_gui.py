@@ -2408,13 +2408,21 @@ class SettingsDialog(QDialog):
 
     def _load_config(self) -> dict:
         """Load current configuration"""
+        config = {}
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    config = json.load(f)
             except:
                 pass
-        return {}
+
+        # Load defaults from analyzer module if not in config
+        if not config.get('home_address'):
+            config['home_address'] = analyzer.HOME_ADDRESS
+        if not config.get('work_address'):
+            config['work_address'] = analyzer.WORK_ADDRESS
+
+        return config
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -2440,20 +2448,25 @@ class SettingsDialog(QDialog):
                 font-weight: bold;
                 border: 1px solid #e0e0e0;
                 border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 10px;
+                margin-top: 14px;
+                padding-top: 14px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
+                subcontrol-position: top left;
                 left: 12px;
+                top: 3px;
                 padding: 0 6px;
+                background-color: white;
             }
         """)
         addr_layout = QVBoxLayout(addr_group)
-        addr_layout.setSpacing(12)
+        addr_layout.setSpacing(6)
+        addr_layout.setContentsMargins(12, 16, 12, 12)
 
         # Home address
         home_label = QLabel("Home Address:")
+        home_label.setStyleSheet("font-weight: normal; margin-bottom: 2px;")
         home_label.setToolTip("Your home address - trips starting/ending here help identify commutes")
         addr_layout.addWidget(home_label)
 
@@ -2467,8 +2480,12 @@ class SettingsDialog(QDialog):
         )
         addr_layout.addWidget(self.home_address)
 
+        # Spacer between address fields
+        addr_layout.addSpacing(10)
+
         # Work address
         work_label = QLabel("Work/Office Address:")
+        work_label.setStyleSheet("font-weight: normal; margin-bottom: 2px;")
         work_label.setToolTip("Your primary workplace - trips to/from here are categorized as commute")
         addr_layout.addWidget(work_label)
 
@@ -2488,10 +2505,12 @@ class SettingsDialog(QDialog):
         api_group = QGroupBox("API Configuration")
         api_group.setStyleSheet(addr_group.styleSheet())
         api_layout = QVBoxLayout(api_group)
-        api_layout.setSpacing(12)
+        api_layout.setSpacing(6)
+        api_layout.setContentsMargins(12, 16, 12, 12)
 
         # Google Places API key
         api_label = QLabel("Google Places API Key:")
+        api_label.setStyleSheet("font-weight: normal; margin-bottom: 2px;")
         api_layout.addWidget(api_label)
 
         api_key_layout = QHBoxLayout()
@@ -2544,18 +2563,20 @@ class SettingsDialog(QDialog):
         thresh_group = QGroupBox("Categorization Thresholds")
         thresh_group.setStyleSheet(addr_group.styleSheet())
         thresh_layout = QVBoxLayout(thresh_group)
-        thresh_layout.setSpacing(12)
+        thresh_layout.setSpacing(10)
+        thresh_layout.setContentsMargins(12, 16, 12, 12)
 
         # Business distance threshold
         biz_dist_layout = QHBoxLayout()
         biz_dist_label = QLabel("Business trip minimum distance:")
+        biz_dist_label.setStyleSheet("font-weight: normal;")
         biz_dist_label.setToolTip("Trips longer than this on weekdays are considered business")
         biz_dist_layout.addWidget(biz_dist_label)
         biz_dist_layout.addStretch()
 
         self.business_distance = QDoubleSpinBox()
         self.business_distance.setRange(1.0, 50.0)
-        self.business_distance.setValue(self.config.get('business_distance_threshold', 8.0))
+        self.business_distance.setValue(self.config.get('business_distance_threshold', analyzer.BUSINESS_DISTANCE_THRESHOLD))
         self.business_distance.setSuffix(" miles")
         self.business_distance.setToolTip(
             "Trips exceeding this distance on weekdays\n"
@@ -2567,6 +2588,7 @@ class SettingsDialog(QDialog):
         # Merge gap threshold
         merge_gap_layout = QHBoxLayout()
         merge_gap_label = QLabel("Merge stops shorter than:")
+        merge_gap_label.setStyleSheet("font-weight: normal;")
         merge_gap_label.setToolTip("Stops shorter than this are merged (red lights, etc.)")
         merge_gap_layout.addWidget(merge_gap_label)
         merge_gap_layout.addStretch()
@@ -2585,6 +2607,7 @@ class SettingsDialog(QDialog):
         # Micro-trip threshold
         micro_layout = QHBoxLayout()
         micro_label = QLabel("Micro-trip threshold:")
+        micro_label.setStyleSheet("font-weight: normal;")
         micro_label.setToolTip("Trips shorter than this are flagged as potential GPS drift")
         micro_layout.addWidget(micro_label)
         micro_layout.addStretch()
