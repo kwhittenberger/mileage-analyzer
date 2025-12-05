@@ -20,9 +20,10 @@ from PyQt6.QtWidgets import (
     QFileDialog, QComboBox, QDateEdit, QGroupBox, QFormLayout,
     QTabWidget, QTextEdit, QMessageBox, QProgressBar, QStatusBar,
     QHeaderView, QMenu, QLineEdit, QCheckBox, QFrame, QStyle,
-    QTreeWidget, QTreeWidgetItem, QAbstractItemView
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView, QDialog,
+    QScrollArea, QDoubleSpinBox
 )
-from PyQt6.QtCore import Qt, QDate, QThread, pyqtSignal, QUrl
+from PyQt6.QtCore import Qt, QDate, QThread, pyqtSignal, QUrl, QSettings, QByteArray
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
@@ -48,6 +49,104 @@ def get_app_dir():
         return os.path.dirname(sys.executable)
     else:
         return os.path.dirname(__file__)
+
+
+def get_trip_key(trip: dict) -> str:
+    """Generate a unique key for a trip based on start time and start address"""
+    started = trip.get('started')
+    if hasattr(started, 'isoformat'):
+        start_str = started.isoformat()
+    else:
+        start_str = str(started)
+    return f"{start_str}|{trip.get('start_address', '')}"
+
+
+def load_trip_notes() -> dict:
+    """Load trip notes from JSON file"""
+    notes_file = os.path.join(get_app_dir(), 'trip_notes.json')
+    if os.path.exists(notes_file):
+        try:
+            with open(notes_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+
+def save_trip_note(trip: dict, note: str) -> tuple[bool, str]:
+    """Save a note for a specific trip.
+    Returns (success, message) tuple."""
+    notes_file = os.path.join(get_app_dir(), 'trip_notes.json')
+    notes = load_trip_notes()
+    trip_key = get_trip_key(trip)
+
+    if note.strip():
+        notes[trip_key] = note.strip()
+    elif trip_key in notes:
+        del notes[trip_key]  # Remove empty notes
+
+    try:
+        with open(notes_file, 'w', encoding='utf-8') as f:
+            json.dump(notes, f, indent=2, ensure_ascii=False)
+        return True, "Note saved"
+    except PermissionError:
+        return False, "Cannot save note - file is in use by another program"
+    except Exception as e:
+        return False, f"Failed to save note: {e}"
+
+
+def get_category_reason(trip: dict, category: str, business_name: str) -> str:
+    """Determine why a trip was categorized a certain way"""
+    end_addr = trip.get('end_address', '')
+    start_addr = trip.get('start_address', '')
+    distance = trip.get('distance', 0)
+    timestamp = trip.get('started')
+
+    # Check for saved category mapping first
+    if analyzer.get_mapping_category(end_addr):
+        return "Saved mapping"
+
+    # Business location detection
+    if analyzer.is_business_location(start_addr) or analyzer.is_business_location(end_addr):
+        return "Known business location"
+
+    # Home/work commute
+    if analyzer.is_home_address(start_addr) and analyzer.is_work_address(end_addr):
+        return "Home to office commute"
+    if analyzer.is_work_address(start_addr) and analyzer.is_home_address(end_addr):
+        return "Office to home commute"
+
+    # Whidbey trips
+    if analyzer.is_whidbey_area(start_addr) or analyzer.is_whidbey_area(end_addr):
+        return "Whidbey area (personal)"
+
+    # Distance threshold
+    if distance >= analyzer.BUSINESS_DISTANCE_THRESHOLD:
+        if timestamp:
+            day_of_week = timestamp.weekday()
+            if day_of_week < 5:
+                return f"Weekday trip >= {analyzer.BUSINESS_DISTANCE_THRESHOLD} mi"
+
+    # Weekend detection
+    if timestamp:
+        day_of_week = timestamp.weekday()
+        hour = timestamp.hour
+        if day_of_week == 4 and hour >= 17:
+            return "Friday after 5pm (weekend)"
+        if day_of_week in [5, 6]:
+            return "Weekend day"
+        if day_of_week == 0 and hour < 7:
+            return "Monday before 7am (weekend)"
+
+    # Local area detection
+    if analyzer.is_bothell_area(start_addr) and analyzer.is_bothell_area(end_addr):
+        if distance < analyzer.BUSINESS_DISTANCE_THRESHOLD:
+            if timestamp and timestamp.weekday() < 5:
+                return "Local weekday trip"
+            else:
+                return "Local weekend trip"
+
+    return "Default personal"
 
 
 class AnalysisWorker(QThread):
@@ -77,8 +176,9 @@ class AnalysisWorker(QThread):
         try:
             self.progress.emit(f"Loading: {self.file_path}")
 
-            # Load configuration
+            # Load configuration and business mapping
             analyzer.load_config()
+            analyzer.load_business_mapping()
 
             # Read trips from file
             self.progress.emit("Reading trips...")
@@ -87,7 +187,19 @@ class AnalysisWorker(QThread):
                 self.error.emit(f"No trips found in file: {self.file_path}")
                 return
 
-            self.progress.emit(f"Loaded {len(trips)} trips. Categorizing...")
+            # Merge false stops (red lights, traffic stops, etc.)
+            self.progress.emit(f"Loaded {len(trips)} trips. Merging false stops...")
+            trips, merge_count = analyzer.merge_short_stops(trips)
+            if merge_count > 0:
+                self.progress.emit(f"Merged {merge_count} false stops. Now {len(trips)} trips.")
+
+            # Flag micro-trips (GPS drift, parking adjustments)
+            self.progress.emit("Flagging micro-trips...")
+            trips, micro_count = analyzer.flag_micro_trips(trips)
+            if micro_count > 0:
+                self.progress.emit(f"Found {micro_count} micro-trips. Categorizing...")
+            else:
+                self.progress.emit(f"{len(trips)} trips ready. Categorizing...")
 
             # Apply date filtering if specified
             if self.start_date:
@@ -113,7 +225,32 @@ class AnalysisWorker(QThread):
                 trip['auto_category'] = category  # lowercase: 'business', 'personal', 'commute'
                 trip['computed_category'] = category.upper()  # uppercase for display
                 trip['business_name'] = business_name or ''
+                trip['category_reason'] = get_category_reason(trip, category, business_name)
                 categorized_trips.append(trip)
+
+            # Save business mapping if lookup was enabled (to persist new lookups)
+            if self.enable_lookup:
+                analyzer.save_business_mapping()
+
+            # Detect duplicate trips
+            self.progress.emit("Checking for duplicates...")
+            duplicate_count = 0
+            seen_trips = {}  # Key: (start_time, end_address) -> trip
+            for trip in categorized_trips:
+                start_time = trip.get('started')
+                end_addr = trip.get('end_address', '').strip().lower()
+                if start_time:
+                    key = (start_time.strftime('%Y-%m-%d %H:%M'), end_addr)
+                    if key in seen_trips:
+                        # Mark both as potential duplicates
+                        trip['is_duplicate'] = True
+                        seen_trips[key]['is_duplicate'] = True
+                        duplicate_count += 1
+                    else:
+                        seen_trips[key] = trip
+
+            if duplicate_count > 0:
+                self.progress.emit(f"Found {duplicate_count} potential duplicate trips.")
 
             # Calculate statistics using same logic as analyze_mileage.py
             self.progress.emit("Calculating statistics...")
@@ -160,16 +297,23 @@ class AnalysisWorker(QThread):
             total_personal = sum(stats['personal'] for stats in weekly_stats.values())
             total_all = sum(stats['total'] for stats in weekly_stats.values())
 
+            # Find date range of all trips (before filtering)
+            all_dates = [t['started'] for t in categorized_trips if t.get('started')]
+            min_date = min(all_dates).strftime('%Y-%m-%d') if all_dates else None
+            max_date = max(all_dates).strftime('%Y-%m-%d') if all_dates else None
+
             result = {
                 'trips': categorized_trips,
                 'weekly_stats': dict(weekly_stats),
+                'date_range': {'min': min_date, 'max': max_date},
                 'totals': {
                     'total_miles': total_all,
                     'business_miles': total_business,
                     'personal_miles': total_personal,
                     'commute_miles': total_commute,
                     'business_pct': (total_business / total_all * 100) if total_all > 0 else 0,
-                    'personal_pct': ((total_personal + total_commute) / total_all * 100) if total_all > 0 else 0
+                    'personal_pct': (total_personal / total_all * 100) if total_all > 0 else 0,
+                    'commute_pct': (total_commute / total_all * 100) if total_all > 0 else 0
                 }
             }
 
@@ -797,6 +941,10 @@ class MapView(QWebEngineView):
 
                 // Decode the polyline
                 const decodedPath = google.maps.geometry.encoding.decodePath(route.polyline.encodedPolyline);
+                console.log('Decoded path has', decodedPath.length, 'points');
+
+                // Check if route is suspiciously simple (less than 5 points for any real road route)
+                const isSimplifiedRoute = decodedPath.length < 5;
 
                 // Draw the route
                 const routeLine = new google.maps.Polyline({{
@@ -804,7 +952,13 @@ class MapView(QWebEngineView):
                     geodesic: true,
                     strokeColor: color,
                     strokeWeight: 5,
-                    strokeOpacity: 0.8
+                    strokeOpacity: isSimplifiedRoute ? 0 : 0.8,
+                    // Show dashed line if route is oversimplified
+                    icons: isSimplifiedRoute ? [{{
+                        icon: {{ path: 'M 0,-1 0,1', strokeOpacity: 0.6, scale: 4 }},
+                        offset: '0',
+                        repeat: '20px'
+                    }}] : []
                 }});
                 routeLine.setMap(map);
                 polylines.push(routeLine);
@@ -938,12 +1092,62 @@ class MapView(QWebEngineView):
 
                     const data = await response.json();
                     if (data.error || !data.routes || data.routes.length === 0) {{
-                        console.error('Route failed for trip', i, data.error);
+                        console.error('Route failed for trip', i, data.error || 'No routes returned');
+                        // Fall back to geocoding the addresses and drawing a dashed line
+                        try {{
+                            const {{ Place }} = await google.maps.importLibrary("places");
+                            const startPlaces = await Place.searchByText({{ textQuery: trip.startAddress, fields: ['location'], maxResultCount: 1 }});
+                            const endPlaces = await Place.searchByText({{ textQuery: trip.endAddress, fields: ['location'], maxResultCount: 1 }});
+
+                            if (startPlaces?.places?.length && endPlaces?.places?.length) {{
+                                const startLoc = startPlaces.places[0].location;
+                                const endLoc = endPlaces.places[0].location;
+                                const fallbackPath = [startLoc, endLoc];
+
+                                // Draw dashed line to indicate it's not a real route
+                                const fallbackLine = new google.maps.Polyline({{
+                                    path: fallbackPath,
+                                    geodesic: true,
+                                    strokeColor: color,
+                                    strokeWeight: 3,
+                                    strokeOpacity: 0,
+                                    icons: [{{
+                                        icon: {{ path: 'M 0,-1 0,1', strokeOpacity: 0.6, scale: 3 }},
+                                        offset: '0',
+                                        repeat: '15px'
+                                    }}]
+                                }});
+                                fallbackLine.setMap(map);
+                                polylines.push(fallbackLine);
+                                bounds.extend(startLoc);
+                                bounds.extend(endLoc);
+
+                                // Add marker for this trip
+                                const marker = new google.maps.Marker({{
+                                    position: endLoc,
+                                    map: map,
+                                    label: {{ text: String(i + 1), color: 'white', fontWeight: 'bold' }},
+                                    icon: {{
+                                        path: google.maps.SymbolPath.CIRCLE,
+                                        scale: 14,
+                                        fillColor: color,
+                                        fillOpacity: 0.6,
+                                        strokeColor: 'white',
+                                        strokeWeight: 2
+                                    }},
+                                    title: 'Trip ' + (i + 1) + ' (route unavailable)'
+                                }});
+                                markers.push(marker);
+                            }}
+                        }} catch (fallbackErr) {{
+                            console.error('Fallback geocoding also failed:', fallbackErr);
+                        }}
                         continue;
                     }}
 
                     const route = data.routes[0];
                     const decodedPath = google.maps.geometry.encoding.decodePath(route.polyline.encodedPolyline);
+                    console.log('Route', i, 'decoded with', decodedPath.length, 'points');
                     allPaths.push({{ path: decodedPath, color: color, trip: trip, index: i }});
 
                     // Draw the route segment
@@ -1121,84 +1325,268 @@ class MapView(QWebEngineView):
 
 
 class SummaryWidget(QWidget):
-    """Widget displaying summary statistics"""
+    """Widget displaying summary statistics with visual cards"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._setup_ui()
 
+    def _create_stat_card(self, title: str, color: str, bg_color: str) -> dict:
+        """Create a styled stat card widget"""
+        card = QFrame()
+        card.setFrameStyle(QFrame.Shape.StyledPanel)
+        card.setStyleSheet(f"""
+            QFrame {{
+                background-color: {bg_color};
+                border: 2px solid {color};
+                border-radius: 8px;
+                padding: 10px;
+            }}
+            QLabel {{
+                border: none;
+                background: transparent;
+                padding: 0px;
+            }}
+        """)
+
+        layout = QVBoxLayout(card)
+        layout.setSpacing(5)
+
+        # Title
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px; border: none;")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+
+        # Miles (big number)
+        miles_label = QLabel("0.0")
+        miles_label.setStyleSheet(f"color: {color}; font-size: 28px; font-weight: bold; border: none;")
+        miles_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(miles_label)
+
+        # Miles text
+        miles_text = QLabel("miles")
+        miles_text.setStyleSheet(f"color: {color}; font-size: 11px; border: none;")
+        miles_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(miles_text)
+
+        # Percentage
+        pct_label = QLabel("")
+        pct_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold; border: none;")
+        pct_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(pct_label)
+
+        # Trip count
+        trips_label = QLabel("0 trips")
+        trips_label.setStyleSheet(f"color: {color}; font-size: 11px; border: none;")
+        trips_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(trips_label)
+
+        return {
+            'card': card,
+            'miles': miles_label,
+            'pct': pct_label,
+            'trips': trips_label
+        }
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setSpacing(15)
 
-        # Totals group
-        totals_group = QGroupBox("Mileage Totals")
-        totals_layout = QFormLayout(totals_group)
+        # Title
+        title = QLabel("Mileage Summary")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #333; padding: 10px; border: none;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
 
-        self.total_label = QLabel("0.0 miles")
-        self.business_label = QLabel("0.0 miles (0%)")
-        self.personal_label = QLabel("0.0 miles (0%)")
-        self.commute_label = QLabel("0.0 miles")
+        # Date range label
+        self.date_range_label = QLabel("")
+        self.date_range_label.setStyleSheet("font-size: 12px; color: #666; padding-bottom: 10px; border: none;")
+        self.date_range_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.date_range_label)
 
-        # Style the labels
-        font = QFont()
-        font.setPointSize(11)
-        font.setBold(True)
+        # Total miles card (larger, at top)
+        total_frame = QFrame()
+        total_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f5f5f5;
+                border: 2px solid #424242;
+                border-radius: 10px;
+                padding: 15px;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+        """)
+        total_layout = QVBoxLayout(total_frame)
 
-        for label in [self.total_label, self.business_label,
-                     self.personal_label, self.commute_label]:
-            label.setFont(font)
+        total_title = QLabel("TOTAL MILEAGE")
+        total_title.setStyleSheet("color: #424242; font-weight: bold; font-size: 12px; border: none;")
+        total_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_layout.addWidget(total_title)
 
-        self.business_label.setStyleSheet("color: #2e7d32;")
-        self.personal_label.setStyleSheet("color: #e65100;")
-        self.commute_label.setStyleSheet("color: #1565c0;")
+        self.total_miles_label = QLabel("0.0")
+        self.total_miles_label.setStyleSheet("color: #212121; font-size: 42px; font-weight: bold; border: none;")
+        self.total_miles_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_layout.addWidget(self.total_miles_label)
 
-        totals_layout.addRow("Total Miles:", self.total_label)
-        totals_layout.addRow("Business:", self.business_label)
-        totals_layout.addRow("Personal:", self.personal_label)
-        totals_layout.addRow("Commute:", self.commute_label)
+        total_text = QLabel("miles")
+        total_text.setStyleSheet("color: #616161; font-size: 14px; border: none;")
+        total_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_layout.addWidget(total_text)
 
-        layout.addWidget(totals_group)
+        self.total_trips_label = QLabel("0 trips")
+        self.total_trips_label.setStyleSheet("color: #616161; font-size: 12px; border: none;")
+        self.total_trips_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_layout.addWidget(self.total_trips_label)
 
-        # Trip counts group
-        counts_group = QGroupBox("Trip Counts")
-        counts_layout = QFormLayout(counts_group)
+        layout.addWidget(total_frame)
 
-        self.total_trips_label = QLabel("0")
-        self.business_trips_label = QLabel("0")
-        self.personal_trips_label = QLabel("0")
-        self.commute_trips_label = QLabel("0")
+        # Category cards in a row
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(10)
 
-        counts_layout.addRow("Total Trips:", self.total_trips_label)
-        counts_layout.addRow("Business Trips:", self.business_trips_label)
-        counts_layout.addRow("Personal Trips:", self.personal_trips_label)
-        counts_layout.addRow("Commute Trips:", self.commute_trips_label)
+        # Business card (green)
+        self.business_card = self._create_stat_card("BUSINESS", "#2e7d32", "#e8f5e9")
+        cards_layout.addWidget(self.business_card['card'])
 
-        layout.addWidget(counts_group)
+        # Personal card (orange)
+        self.personal_card = self._create_stat_card("PERSONAL", "#e65100", "#fff3e0")
+        cards_layout.addWidget(self.personal_card['card'])
+
+        # Commute card (blue)
+        self.commute_card = self._create_stat_card("COMMUTE", "#1565c0", "#e3f2fd")
+        cards_layout.addWidget(self.commute_card['card'])
+
+        layout.addLayout(cards_layout)
+
+        # Additional stats section
+        extras_frame = QFrame()
+        extras_frame.setStyleSheet("""
+            QFrame {
+                background-color: #fafafa;
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                padding: 10px;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+        """)
+        extras_layout = QVBoxLayout(extras_frame)
+
+        extras_title = QLabel("Additional Statistics")
+        extras_title.setStyleSheet("font-weight: bold; color: #666; border: none;")
+        extras_layout.addWidget(extras_title)
+
+        # Grid for extra stats
+        extras_grid = QHBoxLayout()
+
+        # Avg per trip
+        avg_frame = QVBoxLayout()
+        self.avg_miles_label = QLabel("0.0")
+        self.avg_miles_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #333; border: none;")
+        self.avg_miles_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        avg_frame.addWidget(self.avg_miles_label)
+        avg_text = QLabel("avg miles/trip")
+        avg_text.setStyleSheet("font-size: 10px; color: #666; border: none;")
+        avg_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        avg_frame.addWidget(avg_text)
+        extras_grid.addLayout(avg_frame)
+
+        # Business per week
+        biz_week_frame = QVBoxLayout()
+        self.biz_per_week_label = QLabel("0.0")
+        self.biz_per_week_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #2e7d32; border: none;")
+        self.biz_per_week_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        biz_week_frame.addWidget(self.biz_per_week_label)
+        biz_week_text = QLabel("business mi/week")
+        biz_week_text.setStyleSheet("font-size: 10px; color: #666; border: none;")
+        biz_week_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        biz_week_frame.addWidget(biz_week_text)
+        extras_grid.addLayout(biz_week_frame)
+
+        # Days with trips
+        days_frame = QVBoxLayout()
+        self.days_with_trips_label = QLabel("0")
+        self.days_with_trips_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #333; border: none;")
+        self.days_with_trips_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        days_frame.addWidget(self.days_with_trips_label)
+        days_text = QLabel("days with trips")
+        days_text.setStyleSheet("font-size: 10px; color: #666; border: none;")
+        days_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        days_frame.addWidget(days_text)
+        extras_grid.addLayout(days_frame)
+
+        extras_layout.addLayout(extras_grid)
+        layout.addWidget(extras_frame)
+
         layout.addStretch()
 
     def update_stats(self, data: dict):
         """Update the summary display with new data"""
         totals = data.get('totals', {})
         trips = data.get('trips', [])
+        weekly_stats = data.get('weekly_stats', {})
 
-        self.total_label.setText(f"{totals.get('total_miles', 0):.1f} miles")
-        self.business_label.setText(
-            f"{totals.get('business_miles', 0):.1f} miles ({totals.get('business_pct', 0):.1f}%)"
-        )
-        self.personal_label.setText(
-            f"{totals.get('personal_miles', 0):.1f} miles ({totals.get('personal_pct', 0):.1f}%)"
-        )
-        self.commute_label.setText(f"{totals.get('commute_miles', 0):.1f} miles")
+        # Total miles
+        total_miles = totals.get('total_miles', 0)
+        self.total_miles_label.setText(f"{total_miles:,.1f}")
+        self.total_trips_label.setText(f"{len(trips)} trips")
 
-        # Count trips by category
+        # Business
+        business_miles = totals.get('business_miles', 0)
+        business_pct = totals.get('business_pct', 0)
         business_count = sum(1 for t in trips if t.get('computed_category') == 'BUSINESS')
-        personal_count = sum(1 for t in trips if t.get('computed_category') == 'PERSONAL')
-        commute_count = sum(1 for t in trips if t.get('computed_category') == 'COMMUTE')
+        self.business_card['miles'].setText(f"{business_miles:,.1f}")
+        self.business_card['pct'].setText(f"{business_pct:.1f}%")
+        self.business_card['trips'].setText(f"{business_count} trips")
 
-        self.total_trips_label.setText(str(len(trips)))
-        self.business_trips_label.setText(str(business_count))
-        self.personal_trips_label.setText(str(personal_count))
-        self.commute_trips_label.setText(str(commute_count))
+        # Personal
+        personal_miles = totals.get('personal_miles', 0)
+        personal_pct = totals.get('personal_pct', 0)
+        personal_count = sum(1 for t in trips if t.get('computed_category') == 'PERSONAL')
+        self.personal_card['miles'].setText(f"{personal_miles:,.1f}")
+        self.personal_card['pct'].setText(f"{personal_pct:.1f}%")
+        self.personal_card['trips'].setText(f"{personal_count} trips")
+
+        # Commute
+        commute_miles = totals.get('commute_miles', 0)
+        commute_pct = totals.get('commute_pct', 0)
+        commute_count = sum(1 for t in trips if t.get('computed_category') == 'COMMUTE')
+        self.commute_card['miles'].setText(f"{commute_miles:,.1f}")
+        self.commute_card['pct'].setText(f"{commute_pct:.1f}%")
+        self.commute_card['trips'].setText(f"{commute_count} trips")
+
+        # Date range
+        if trips:
+            dates = [t['started'] for t in trips if t.get('started')]
+            if dates:
+                min_date = min(dates).strftime('%b %d, %Y')
+                max_date = max(dates).strftime('%b %d, %Y')
+                self.date_range_label.setText(f"{min_date} — {max_date}")
+
+        # Additional stats
+        if trips:
+            avg_miles = total_miles / len(trips)
+            self.avg_miles_label.setText(f"{avg_miles:.1f}")
+
+            # Unique days with trips
+            unique_days = len(set(t['started'].date() for t in trips if t.get('started')))
+            self.days_with_trips_label.setText(str(unique_days))
+
+            # Business miles per week
+            if weekly_stats:
+                num_weeks = len(weekly_stats)
+                if num_weeks > 0:
+                    biz_per_week = business_miles / num_weeks
+                    self.biz_per_week_label.setText(f"{biz_per_week:.1f}")
+        else:
+            self.avg_miles_label.setText("0.0")
+            self.days_with_trips_label.setText("0")
+            self.biz_per_week_label.setText("0.0")
 
 
 class UnresolvedAddressesWidget(QWidget):
@@ -1299,6 +1687,14 @@ class UnresolvedAddressesWidget(QWidget):
         self.business_name_input.setPlaceholderText("Enter business name for selected address(es)...")
         self.business_name_input.returnPressed.connect(self._save_mapping)
         name_layout.addWidget(self.business_name_input)
+
+        # Category dropdown
+        name_layout.addWidget(QLabel("Category:"))
+        self.category_combo = QComboBox()
+        self.category_combo.addItems(["Business", "Personal", "Commute"])
+        self.category_combo.setCurrentText("Business")
+        self.category_combo.setFixedWidth(100)
+        name_layout.addWidget(self.category_combo)
 
         self.save_btn = QPushButton("Save")
         self.save_btn.clicked.connect(self._save_mapping)
@@ -1594,8 +1990,11 @@ class UnresolvedAddressesWidget(QWidget):
             QMessageBox.warning(self, "No Name", "Please enter a business name.")
             return
 
-        # Save all selected addresses with the same name
-        self._save_multiple_to_mapping_file(self.selected_addresses, name)
+        # Get category from dropdown
+        category = self.category_combo.currentText().upper()
+
+        # Save all selected addresses with the same name and category
+        self._save_multiple_to_mapping_file(self.selected_addresses, name, category)
         self.business_name_input.clear()
         self._remove_selected_from_list()
         self.mapping_saved.emit()
@@ -1605,15 +2004,15 @@ class UnresolvedAddressesWidget(QWidget):
         if not self.selected_addresses:
             return
 
-        self._save_multiple_to_mapping_file(self.selected_addresses, "[PERSONAL]")
+        self._save_multiple_to_mapping_file(self.selected_addresses, "[PERSONAL]", "PERSONAL")
         self._remove_selected_from_list()
         self.mapping_saved.emit()
 
-    def _save_multiple_to_mapping_file(self, addresses: List[str], name: str):
+    def _save_multiple_to_mapping_file(self, addresses: List[str], name: str, category: str = None):
         """Save multiple address mappings to the business_mapping.json file"""
         mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
 
-        # Load existing
+        # Load existing mapping
         mappings = {}
         if os.path.exists(mapping_file):
             try:
@@ -1622,11 +2021,14 @@ class UnresolvedAddressesWidget(QWidget):
             except:
                 pass
 
-        # Add all mappings
+        # Add all mappings with new format including category and source
         for address in addresses:
-            mappings[address] = name
+            entry = {"name": name, "source": "manual"}
+            if category:
+                entry["category"] = category
+            mappings[address] = entry
 
-        # Save
+        # Save file
         try:
             with open(mapping_file, 'w', encoding='utf-8') as f:
                 json.dump(mappings, f, indent=2, ensure_ascii=False)
@@ -1988,8 +2390,390 @@ class UnresolvedAddressesWidget(QWidget):
         self.mapping_saved.emit()
 
 
+class SettingsDialog(QDialog):
+    """Dialog for editing application settings including addresses and API keys"""
+
+    settings_changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumSize(550, 500)
+        self.resize(600, 550)
+
+        self.config_file = "config.json"
+        self.config = self._load_config()
+
+        self._setup_ui()
+
+    def _load_config(self) -> dict:
+        """Load current configuration"""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+
+        # Title
+        title = QLabel("Application Settings")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #1976d2;")
+        layout.addWidget(title)
+
+        # Scroll area for settings
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(20)
+
+        # === ADDRESSES SECTION ===
+        addr_group = QGroupBox("Home & Office Addresses")
+        addr_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+            }
+        """)
+        addr_layout = QVBoxLayout(addr_group)
+        addr_layout.setSpacing(12)
+
+        # Home address
+        home_label = QLabel("Home Address:")
+        home_label.setToolTip("Your home address - trips starting/ending here help identify commutes")
+        addr_layout.addWidget(home_label)
+
+        self.home_address = QLineEdit()
+        self.home_address.setPlaceholderText("e.g., 123 Main St, Seattle, WA 98101")
+        self.home_address.setText(self.config.get('home_address', ''))
+        self.home_address.setToolTip(
+            "Enter your home address.\n\n"
+            "This is used to identify commute trips and distinguish\n"
+            "between personal and business travel."
+        )
+        addr_layout.addWidget(self.home_address)
+
+        # Work address
+        work_label = QLabel("Work/Office Address:")
+        work_label.setToolTip("Your primary workplace - trips to/from here are categorized as commute")
+        addr_layout.addWidget(work_label)
+
+        self.work_address = QLineEdit()
+        self.work_address.setPlaceholderText("e.g., 456 Corporate Blvd, Bellevue, WA 98004")
+        self.work_address.setText(self.config.get('work_address', ''))
+        self.work_address.setToolTip(
+            "Enter your primary workplace address.\n\n"
+            "Trips between home and this address are categorized\n"
+            "as commute (not tax-deductible business miles)."
+        )
+        addr_layout.addWidget(self.work_address)
+
+        scroll_layout.addWidget(addr_group)
+
+        # === API KEYS SECTION ===
+        api_group = QGroupBox("API Configuration")
+        api_group.setStyleSheet(addr_group.styleSheet())
+        api_layout = QVBoxLayout(api_group)
+        api_layout.setSpacing(12)
+
+        # Google Places API key
+        api_label = QLabel("Google Places API Key:")
+        api_layout.addWidget(api_label)
+
+        api_key_layout = QHBoxLayout()
+        self.api_key = QLineEdit()
+        self.api_key.setPlaceholderText("Enter your Google Places API key")
+        self.api_key.setText(self.config.get('google_places_api_key', ''))
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setToolTip(
+            "Google Places API key for business name lookups.\n\n"
+            "Get a key from: console.cloud.google.com\n"
+            "Enable: Places API, Geocoding API, Routes API\n\n"
+            "Leave blank to use free OpenStreetMap lookups instead."
+        )
+        api_key_layout.addWidget(self.api_key)
+
+        # Show/hide toggle
+        self.show_key_btn = QPushButton("Show")
+        self.show_key_btn.setFixedWidth(60)
+        self.show_key_btn.setCheckable(True)
+        self.show_key_btn.clicked.connect(self._toggle_api_key_visibility)
+        api_key_layout.addWidget(self.show_key_btn)
+
+        api_layout.addLayout(api_key_layout)
+
+        # API key help text
+        api_help = QLabel(
+            "The Google Places API provides accurate business name lookups.\n"
+            "Without it, the app uses OpenStreetMap (free but less accurate)."
+        )
+        api_help.setStyleSheet("color: #666; font-size: 11px;")
+        api_help.setWordWrap(True)
+        api_layout.addWidget(api_help)
+
+        # Test API button
+        test_layout = QHBoxLayout()
+        test_layout.addStretch()
+        self.test_api_btn = QPushButton("Test API Key")
+        self.test_api_btn.setToolTip("Verify that your API key is valid and working")
+        self.test_api_btn.clicked.connect(self._test_api_key)
+        test_layout.addWidget(self.test_api_btn)
+        api_layout.addLayout(test_layout)
+
+        self.api_status = QLabel("")
+        self.api_status.setWordWrap(True)
+        api_layout.addWidget(self.api_status)
+
+        scroll_layout.addWidget(api_group)
+
+        # === CATEGORIZATION THRESHOLDS SECTION ===
+        thresh_group = QGroupBox("Categorization Thresholds")
+        thresh_group.setStyleSheet(addr_group.styleSheet())
+        thresh_layout = QVBoxLayout(thresh_group)
+        thresh_layout.setSpacing(12)
+
+        # Business distance threshold
+        biz_dist_layout = QHBoxLayout()
+        biz_dist_label = QLabel("Business trip minimum distance:")
+        biz_dist_label.setToolTip("Trips longer than this on weekdays are considered business")
+        biz_dist_layout.addWidget(biz_dist_label)
+        biz_dist_layout.addStretch()
+
+        self.business_distance = QDoubleSpinBox()
+        self.business_distance.setRange(1.0, 50.0)
+        self.business_distance.setValue(self.config.get('business_distance_threshold', 8.0))
+        self.business_distance.setSuffix(" miles")
+        self.business_distance.setToolTip(
+            "Trips exceeding this distance on weekdays\n"
+            "are automatically categorized as business travel."
+        )
+        biz_dist_layout.addWidget(self.business_distance)
+        thresh_layout.addLayout(biz_dist_layout)
+
+        # Merge gap threshold
+        merge_gap_layout = QHBoxLayout()
+        merge_gap_label = QLabel("Merge stops shorter than:")
+        merge_gap_label.setToolTip("Stops shorter than this are merged (red lights, etc.)")
+        merge_gap_layout.addWidget(merge_gap_label)
+        merge_gap_layout.addStretch()
+
+        self.merge_gap = QDoubleSpinBox()
+        self.merge_gap.setRange(1.0, 10.0)
+        self.merge_gap.setValue(self.config.get('merge_gap_minutes', 3.0))
+        self.merge_gap.setSuffix(" minutes")
+        self.merge_gap.setToolTip(
+            "Short stops (traffic lights, brief pauses) are merged\n"
+            "into a single trip if shorter than this duration."
+        )
+        merge_gap_layout.addWidget(self.merge_gap)
+        thresh_layout.addLayout(merge_gap_layout)
+
+        # Micro-trip threshold
+        micro_layout = QHBoxLayout()
+        micro_label = QLabel("Micro-trip threshold:")
+        micro_label.setToolTip("Trips shorter than this are flagged as potential GPS drift")
+        micro_layout.addWidget(micro_label)
+        micro_layout.addStretch()
+
+        self.micro_threshold = QDoubleSpinBox()
+        self.micro_threshold.setRange(0.05, 1.0)
+        self.micro_threshold.setValue(self.config.get('micro_trip_threshold', 0.15))
+        self.micro_threshold.setSuffix(" miles")
+        self.micro_threshold.setSingleStep(0.05)
+        self.micro_threshold.setToolTip(
+            "Very short trips are flagged as possible GPS drift\n"
+            "or parking lot movements for your review."
+        )
+        micro_layout.addWidget(self.micro_threshold)
+        thresh_layout.addLayout(micro_layout)
+
+        scroll_layout.addWidget(thresh_group)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+
+        # === BUTTONS ===
+        button_layout = QHBoxLayout()
+
+        # Reset to defaults button
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setToolTip("Reset all settings to their default values")
+        reset_btn.clicked.connect(self._reset_to_defaults)
+        reset_btn.setStyleSheet("background-color: #757575;")
+        button_layout.addWidget(reset_btn)
+
+        button_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setStyleSheet("background-color: #757575;")
+        button_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save Settings")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._save_settings)
+        button_layout.addWidget(save_btn)
+
+        layout.addLayout(button_layout)
+
+    def _toggle_api_key_visibility(self):
+        """Toggle API key visibility"""
+        if self.show_key_btn.isChecked():
+            self.api_key.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.show_key_btn.setText("Hide")
+        else:
+            self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self.show_key_btn.setText("Show")
+
+    def _test_api_key(self):
+        """Test the API key by making a simple request"""
+        api_key = self.api_key.text().strip()
+        if not api_key:
+            self.api_status.setText("No API key entered.")
+            self.api_status.setStyleSheet("color: #ff9800;")
+            return
+
+        self.api_status.setText("Testing API key...")
+        self.api_status.setStyleSheet("color: #666;")
+        self.test_api_btn.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            import googlemaps
+            client = googlemaps.Client(key=api_key)
+            # Try a simple geocode request
+            result = client.geocode("Seattle, WA")
+            if result:
+                self.api_status.setText("API key is valid and working!")
+                self.api_status.setStyleSheet("color: #388e3c; font-weight: bold;")
+            else:
+                self.api_status.setText("API key accepted but returned no results.")
+                self.api_status.setStyleSheet("color: #ff9800;")
+        except googlemaps.exceptions.ApiError as e:
+            self.api_status.setText(f"API Error: {str(e)}")
+            self.api_status.setStyleSheet("color: #d32f2f;")
+        except Exception as e:
+            self.api_status.setText(f"Error: {str(e)}")
+            self.api_status.setStyleSheet("color: #d32f2f;")
+        finally:
+            self.test_api_btn.setEnabled(True)
+
+    def _reset_to_defaults(self):
+        """Reset all settings to default values"""
+        reply = QMessageBox.question(
+            self, "Reset Settings",
+            "Are you sure you want to reset all settings to their default values?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.home_address.clear()
+            self.work_address.clear()
+            self.api_key.clear()
+            self.business_distance.setValue(8.0)
+            self.merge_gap.setValue(3.0)
+            self.micro_threshold.setValue(0.15)
+            self.api_status.clear()
+
+    def _save_settings(self):
+        """Save settings to config file"""
+        # Build config dict
+        new_config = {
+            'home_address': self.home_address.text().strip(),
+            'work_address': self.work_address.text().strip(),
+            'google_places_api_key': self.api_key.text().strip(),
+            'business_distance_threshold': self.business_distance.value(),
+            'merge_gap_minutes': self.merge_gap.value(),
+            'micro_trip_threshold': self.micro_threshold.value()
+        }
+
+        # Preserve any other existing config values
+        for key, value in self.config.items():
+            if key not in new_config:
+                new_config[key] = value
+
+        try:
+            # Create backup before saving
+            if os.path.exists(self.config_file):
+                import shutil
+                shutil.copy2(self.config_file, self.config_file + '.bak')
+
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(new_config, f, indent=2)
+
+            self.settings_changed.emit()
+            QMessageBox.information(
+                self, "Settings Saved",
+                "Settings have been saved successfully.\n\n"
+                "Some changes may require re-running the analysis to take effect."
+            )
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error Saving Settings",
+                f"Could not save settings:\n{str(e)}"
+            )
+
+
+class NoteDialog(QDialog):
+    """Dialog for editing trip notes with a multi-line text area"""
+
+    def __init__(self, trip_info: str, current_note: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Trip Note")
+        self.setMinimumSize(500, 300)
+        self.resize(600, 350)
+
+        layout = QVBoxLayout(self)
+
+        # Trip info label
+        info_label = QLabel(f"Note for trip:\n{trip_info}")
+        info_label.setStyleSheet("color: #666; padding: 5px; background: #f5f5f5; border-radius: 3px;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Multi-line text edit
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlainText(current_note)
+        self.text_edit.setPlaceholderText("Enter your notes here...")
+        self.text_edit.setMinimumHeight(150)
+        layout.addWidget(self.text_edit)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        button_layout.addWidget(save_btn)
+
+        layout.addLayout(button_layout)
+
+    def get_note(self) -> str:
+        return self.text_edit.toPlainText()
+
+
 class JsonEditorDialog(QMainWindow):
-    """Dialog for viewing and editing JSON files (address_cache, business_mapping)"""
+    """Dialog for viewing and editing business mappings with Category support"""
 
     data_saved = pyqtSignal()
 
@@ -1998,7 +2782,7 @@ class JsonEditorDialog(QMainWindow):
         self.file_path = file_path
         self.data = {}
         self.setWindowTitle(title)
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(900, 600)
         self._setup_ui()
         self._load_data()
 
@@ -2018,6 +2802,15 @@ class JsonEditorDialog(QMainWindow):
 
         toolbar.addStretch()
 
+        # Filter by source
+        toolbar.addWidget(QLabel("Show:"))
+        self.source_filter = QComboBox()
+        self.source_filter.addItems(["All", "Manual Only", "API Only", "Unresolved"])
+        self.source_filter.currentTextChanged.connect(self._filter_table)
+        toolbar.addWidget(self.source_filter)
+
+        toolbar.addStretch()
+
         add_btn = QPushButton("Add Entry")
         add_btn.clicked.connect(self._add_entry)
         toolbar.addWidget(add_btn)
@@ -2026,18 +2819,30 @@ class JsonEditorDialog(QMainWindow):
         delete_btn.clicked.connect(self._delete_selected)
         toolbar.addWidget(delete_btn)
 
+        # Re-lookup button for API entries
+        relookup_btn = QPushButton("Re-lookup Selected")
+        relookup_btn.setToolTip("Clear selected API entries to allow re-lookup")
+        relookup_btn.clicked.connect(self._relookup_selected)
+        toolbar.addWidget(relookup_btn)
+
         layout.addLayout(toolbar)
 
-        # Table
+        # Table with 4 columns: Address, Business Name, Category, Source
         self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Address/Key", "Business Name/Value"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Address", "Business Name", "Category", "Source"])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 300)
+        self.table.setColumnWidth(1, 200)
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(3, 100)
 
         self.table.cellChanged.connect(self._on_cell_changed)
         layout.addWidget(self.table)
@@ -2075,21 +2880,50 @@ class JsonEditorDialog(QMainWindow):
     def _populate_table(self):
         """Populate table with data"""
         self.table.blockSignals(True)
-        self.table.setRowCount(len(self.data))
 
-        for row, (key, value) in enumerate(sorted(self.data.items())):
+        # Filter out comment entries (keys starting with _)
+        filtered_data = {k: v for k, v in self.data.items() if not k.startswith('_')}
+        self.table.setRowCount(len(filtered_data))
+
+        for row, (key, value) in enumerate(sorted(filtered_data.items())):
+            # Address
             key_item = QTableWidgetItem(str(key))
             self.table.setItem(row, 0, key_item)
 
             # Handle different value types
             if isinstance(value, dict):
-                # For address_cache entries which are dicts with 'name' key
-                display_value = value.get('name', str(value))
+                name = value.get('name', '')
+                category = value.get('category', '')
+                source = value.get('source', 'manual')
             else:
-                display_value = str(value)
+                # Old format: just a string
+                name = str(value)
+                category = ''
+                source = 'manual'
 
-            value_item = QTableWidgetItem(display_value)
-            self.table.setItem(row, 1, value_item)
+            # Business Name
+            name_item = QTableWidgetItem(name)
+            if name == "NO_BUSINESS_FOUND":
+                name_item.setForeground(QColor('#999999'))
+            self.table.setItem(row, 1, name_item)
+
+            # Category (use combo box)
+            category_combo = QComboBox()
+            category_combo.addItems(["", "Business", "Personal", "Commute"])
+            if category:
+                idx = category_combo.findText(category, Qt.MatchFlag.MatchFixedString)
+                if idx >= 0:
+                    category_combo.setCurrentIndex(idx)
+            self.table.setCellWidget(row, 2, category_combo)
+
+            # Source (read-only display)
+            source_item = QTableWidgetItem(source)
+            source_item.setFlags(source_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if source in ['google_api', 'osm_api']:
+                source_item.setForeground(QColor('#2196F3'))
+            else:
+                source_item.setForeground(QColor('#4CAF50'))
+            self.table.setItem(row, 3, source_item)
 
         self.table.blockSignals(False)
         self._update_stats()
@@ -2100,17 +2934,34 @@ class JsonEditorDialog(QMainWindow):
         total = self.table.rowCount()
         self.stats_label.setText(f"Showing {visible} of {total} entries")
 
-    def _filter_table(self, text: str):
-        """Filter table rows based on search text"""
-        text = text.lower()
+    def _filter_table(self, text: str = None):
+        """Filter table rows based on search text and source filter"""
+        search_text = self.search_box.text().lower()
+        source_filter = self.source_filter.currentText()
+
         for row in range(self.table.rowCount()):
             key_item = self.table.item(row, 0)
-            value_item = self.table.item(row, 1)
-            key_text = key_item.text().lower() if key_item else ""
-            value_text = value_item.text().lower() if value_item else ""
+            name_item = self.table.item(row, 1)
+            source_item = self.table.item(row, 3)
 
-            show = text in key_text or text in value_text
-            self.table.setRowHidden(row, not show)
+            key_text = key_item.text().lower() if key_item else ""
+            name_text = name_item.text().lower() if name_item else ""
+            source_text = source_item.text() if source_item else ""
+
+            # Text search filter
+            text_match = not search_text or (search_text in key_text or search_text in name_text)
+
+            # Source filter
+            if source_filter == "Manual Only":
+                source_match = source_text == "manual"
+            elif source_filter == "API Only":
+                source_match = source_text in ["google_api", "osm_api"]
+            elif source_filter == "Unresolved":
+                source_match = name_text == "no_business_found"
+            else:
+                source_match = True
+
+            self.table.setRowHidden(row, not (text_match and source_match))
 
         self._update_stats()
 
@@ -2126,6 +2977,18 @@ class JsonEditorDialog(QMainWindow):
         self.table.insertRow(row)
         self.table.setItem(row, 0, QTableWidgetItem(""))
         self.table.setItem(row, 1, QTableWidgetItem(""))
+
+        # Add category combo
+        category_combo = QComboBox()
+        category_combo.addItems(["", "Business", "Personal", "Commute"])
+        self.table.setCellWidget(row, 2, category_combo)
+
+        # Source is "manual" for new entries
+        source_item = QTableWidgetItem("manual")
+        source_item.setFlags(source_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        source_item.setForeground(QColor('#4CAF50'))
+        self.table.setItem(row, 3, source_item)
+
         self.table.blockSignals(False)
         self.table.scrollToItem(self.table.item(row, 0))
         self.table.editItem(self.table.item(row, 0))
@@ -2148,25 +3011,63 @@ class JsonEditorDialog(QMainWindow):
                 self.table.removeRow(row)
             self._update_stats()
 
+    def _relookup_selected(self):
+        """Mark selected API entries for re-lookup by deleting them"""
+        rows = set(index.row() for index in self.table.selectedIndexes())
+        if not rows:
+            QMessageBox.information(self, "No Selection", "Please select entries to re-lookup.")
+            return
+
+        # Filter to only API entries
+        api_rows = []
+        for row in rows:
+            source_item = self.table.item(row, 3)
+            if source_item and source_item.text() in ['google_api', 'osm_api']:
+                api_rows.append(row)
+
+        if not api_rows:
+            QMessageBox.information(self, "No API Entries",
+                "None of the selected entries are API lookups.\n"
+                "Only API lookup entries can be marked for re-lookup.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Re-lookup",
+            f"Remove {len(api_rows)} API entries to allow re-lookup?\n\n"
+            "Manual entries will not be affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            for row in sorted(api_rows, reverse=True):
+                self.table.removeRow(row)
+            self._update_stats()
+            QMessageBox.information(self, "Done",
+                f"Removed {len(api_rows)} entries.\n"
+                "Run analysis with lookup to re-fetch business names.")
+
     def _save_data(self):
         """Save data back to JSON file"""
         new_data = {}
 
         for row in range(self.table.rowCount()):
             key_item = self.table.item(row, 0)
-            value_item = self.table.item(row, 1)
+            name_item = self.table.item(row, 1)
+            category_combo = self.table.cellWidget(row, 2)
+            source_item = self.table.item(row, 3)
 
             if key_item and key_item.text().strip():
                 key = key_item.text().strip()
-                value = value_item.text().strip() if value_item else ""
+                name = name_item.text().strip() if name_item else ""
+                category = category_combo.currentText() if category_combo else ""
+                source = source_item.text() if source_item else "manual"
 
-                # Check if original was a dict (address_cache format)
-                if key in self.data and isinstance(self.data[key], dict):
-                    # Preserve dict structure, update 'name'
-                    new_data[key] = self.data[key].copy()
-                    new_data[key]['name'] = value
-                else:
-                    new_data[key] = value
+                # Build entry in new format
+                entry = {'name': name, 'source': source}
+                if category:
+                    entry['category'] = category
+
+                new_data[key] = entry
 
         try:
             with open(self.file_path, 'w', encoding='utf-8') as f:
@@ -2200,7 +3101,7 @@ class UnifiedTripView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # Filter bar - two rows to prevent overlap when resizing
+        # Filter bar - three rows for better spacing
         filter_frame = QFrame()
         filter_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         filter_vlayout = QVBoxLayout(filter_frame)
@@ -2213,19 +3114,43 @@ class UnifiedTripView(QWidget):
 
         row1.addWidget(QLabel("View:"))
         self.view_mode_combo = QComboBox()
-        self.view_mode_combo.addItems(["By Destination", "All Trips", "By Day"])
+        self.view_mode_combo.addItems(["By Destination", "All Trips", "By Day", "By Week"])
+        self.view_mode_combo.setMinimumWidth(120)
+        self.view_mode_combo.setToolTip(
+            "Change how trips are displayed:\n\n"
+            "• By Destination - Group trips by end address (best for categorizing)\n"
+            "• All Trips - Show each trip individually with full details\n"
+            "• By Day - Expandable tree grouped by date\n"
+            "• By Week - Expandable tree grouped by week with daily breakdown"
+        )
         self.view_mode_combo.currentTextChanged.connect(self._on_view_mode_changed)
         row1.addWidget(self.view_mode_combo)
 
         row1.addWidget(QLabel("Category:"))
         self.category_filter = QComboBox()
         self.category_filter.addItems(["All", "Business", "Personal", "Commute"])
+        self.category_filter.setMinimumWidth(90)
+        self.category_filter.setToolTip(
+            "Filter trips by category:\n\n"
+            "• All - Show all trips regardless of category\n"
+            "• Business - Only show business-related trips (tax deductible)\n"
+            "• Personal - Only show personal trips\n"
+            "• Commute - Only show home-to-office commute trips"
+        )
         self.category_filter.currentTextChanged.connect(self._apply_filters)
         row1.addWidget(self.category_filter)
 
         row1.addWidget(QLabel("Status:"))
         self.status_filter = QComboBox()
-        self.status_filter.addItems(["All", "Unresolved", "Resolved", "Unconfirmed Business"])
+        self.status_filter.addItems(["All", "Unresolved", "Resolved", "Unconfirmed", "Duplicates"])
+        self.status_filter.setMinimumWidth(100)
+        self.status_filter.setToolTip(
+            "Filter by resolution status:\n\n"
+            "• All - Show all destinations\n"
+            "• Unresolved - Destinations that need a business name assigned\n"
+            "• Resolved - Destinations with confirmed business names\n"
+            "• Unconfirmed - Business trips without confirmed names"
+        )
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         row1.addWidget(self.status_filter)
 
@@ -2238,22 +3163,44 @@ class UnifiedTripView(QWidget):
 
         filter_vlayout.addLayout(row1)
 
-        # Row 2: Business filter and Search
+        # Row 2: Business filter, Search, and Micro-trips checkbox
         row2 = QHBoxLayout()
         row2.setSpacing(8)
 
         row2.addWidget(QLabel("Business:"))
         self.business_filter = QComboBox()
         self.business_filter.addItem("All")
-        self.business_filter.setSizePolicy(self.business_filter.sizePolicy().horizontalPolicy(), self.business_filter.sizePolicy().verticalPolicy())
+        self.business_filter.setMinimumWidth(150)
+        self.business_filter.setToolTip(
+            "Filter trips by business name.\n\n"
+            "Shows only trips to/from the selected business.\n"
+            "The list is populated from your saved business mappings."
+        )
         self.business_filter.currentTextChanged.connect(self._apply_filters)
-        row2.addWidget(self.business_filter, 1)  # Stretch factor 1
+        row2.addWidget(self.business_filter, 1)
 
         row2.addWidget(QLabel("Search:"))
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search...")
+        self.search_box.setMinimumWidth(120)
+        self.search_box.setToolTip(
+            "Search trips by text.\n\n"
+            "Searches across addresses, business names, and other fields.\n"
+            "Results update as you type."
+        )
         self.search_box.textChanged.connect(self._apply_filters)
-        row2.addWidget(self.search_box, 1)  # Stretch factor 1
+        row2.addWidget(self.search_box, 1)
+
+        # Micro-trip filter checkbox (moved to row 2)
+        self.hide_micro_trips = QCheckBox("Hide Micro-trips")
+        self.hide_micro_trips.setToolTip(
+            "Hide very short trips that are likely GPS drift or parking adjustments.\n\n"
+            "Micro-trips are trips under 0.15 miles that start and end on the same\n"
+            "street. These are often caused by GPS inaccuracy or vehicle repositioning.\n\n"
+            "Uncheck to see all trips including micro-trips (marked with ⚠)."
+        )
+        self.hide_micro_trips.stateChanged.connect(self._apply_filters)
+        row2.addWidget(self.hide_micro_trips)
 
         filter_vlayout.addLayout(row2)
 
@@ -2265,13 +3212,14 @@ class UnifiedTripView(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setSortingEnabled(True)
-        # Keep selection visible even when table loses focus
-        self.table.setStyleSheet("""
-            QTableWidget::item:selected {
-                background-color: #0078d4;
-                color: white;
-            }
-        """)
+        self.table.setToolTip(
+            "Trip data table.\n\n"
+            "• Click a column header to sort\n"
+            "• Double-click a row to view on map\n"
+            "• Right-click for options (categorize, rename, etc.)\n"
+            "• Hold Ctrl/Shift to select multiple rows\n"
+            "• Drag column borders to resize"
+        )
 
         # Context menu
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -2285,23 +3233,25 @@ class UnifiedTripView(QWidget):
         self.tree = QTreeWidget()
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        # Keep selection visible even when tree loses focus
-        self.tree.setStyleSheet("""
-            QTreeWidget::item:selected {
-                background-color: #0078d4;
-                color: white;
-            }
-        """)
-        self.tree.setHeaderLabels(["Date / Trip", "Time", "Category", "Miles", "Destination"])
+        self.tree.setToolTip(
+            "Expandable trip tree view.\n\n"
+            "• Click the arrow or double-click to expand/collapse\n"
+            "• Click a trip to view it on the map\n"
+            "• Right-click for options (categorize, etc.)\n"
+            "• Green = Business miles, Orange = Personal miles"
+        )
+        self.tree.setHeaderLabels(["Date / Trip", "Trips / Category", "Business", "Personal", "Total / Destination"])
         self.tree.setColumnWidth(0, 180)
-        self.tree.setColumnWidth(1, 60)
-        self.tree.setColumnWidth(2, 80)
-        self.tree.setColumnWidth(3, 70)
+        self.tree.setColumnWidth(1, 120)
+        self.tree.setColumnWidth(2, 100)
+        self.tree.setColumnWidth(3, 100)
         self.tree.header().setStretchLastSection(True)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
         self.tree.itemExpanded.connect(self._on_tree_item_expanded)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         self.tree.hide()  # Hidden by default
         layout.addWidget(self.tree)
 
@@ -2310,42 +3260,40 @@ class UnifiedTripView(QWidget):
 
     def _setup_grouped_columns(self):
         """Set up columns for grouped (by destination) view"""
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "Destination", "Business Name", "Category", "Trips", "Miles", "Status", "Street"
+            "Business Name", "Category", "Trips", "Miles", "Status", "Destination Address"
         ])
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(2, 80)
-        self.table.setColumnWidth(3, 50)
-        self.table.setColumnWidth(4, 70)
-        self.table.setColumnWidth(5, 100)
-        self.table.setColumnWidth(6, 100)
+        for i in range(6):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 200)  # Business Name
+        self.table.setColumnWidth(1, 85)   # Category
+        self.table.setColumnWidth(2, 50)   # Trips
+        self.table.setColumnWidth(3, 70)   # Miles
+        self.table.setColumnWidth(4, 110)  # Status
+        self.table.setColumnWidth(5, 280)  # Destination Address
 
     def _setup_individual_columns(self):
         """Set up columns for individual trips view"""
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
-            "Date", "Day", "Category", "Distance", "From", "To", "Business Name"
+            "Date", "Day", "Start", "End", "Category", "Reason", "Distance", "From", "To", "Business Name", "Notes"
         ])
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 130)
-        self.table.setColumnWidth(1, 50)
-        self.table.setColumnWidth(2, 80)
-        self.table.setColumnWidth(3, 70)
+        for i in range(11):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 95)   # Date
+        self.table.setColumnWidth(1, 50)   # Day
+        self.table.setColumnWidth(2, 55)   # Start time
+        self.table.setColumnWidth(3, 55)   # End time
+        self.table.setColumnWidth(4, 85)   # Category
+        self.table.setColumnWidth(5, 140)  # Reason
+        self.table.setColumnWidth(6, 70)   # Distance
+        self.table.setColumnWidth(7, 180)  # From
+        self.table.setColumnWidth(8, 180)  # To
+        self.table.setColumnWidth(9, 150)  # Business Name
+        self.table.setColumnWidth(10, 180) # Notes
 
     def _setup_by_day_columns(self):
         """Set up columns for by-day view"""
@@ -2366,6 +3314,23 @@ class UnifiedTripView(QWidget):
         self.table.setColumnWidth(3, 80)
         self.table.setColumnWidth(4, 100)
 
+    def _setup_weekly_columns(self):
+        """Set up columns for weekly view"""
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "Week Starting", "Trips", "Business", "Personal", "Commute", "Total", "Bus %"
+        ])
+        header = self.table.horizontalHeader()
+        for i in range(7):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 100)  # Week
+        self.table.setColumnWidth(1, 50)   # Trips
+        self.table.setColumnWidth(2, 80)   # Business
+        self.table.setColumnWidth(3, 80)   # Personal
+        self.table.setColumnWidth(4, 80)   # Commute
+        self.table.setColumnWidth(5, 80)   # Total
+        self.table.setColumnWidth(6, 60)   # %
+
     def _on_view_mode_changed(self, mode: str):
         """Handle view mode change"""
         if mode == "By Destination":
@@ -2377,6 +3342,12 @@ class UnifiedTripView(QWidget):
             self.view_mode = "by_day"
             self.table.hide()
             self.tree.show()
+            self._setup_by_day_tree_columns()
+        elif mode == "By Week":
+            self.view_mode = "weekly"
+            self.table.hide()
+            self.tree.show()
+            self._setup_weekly_tree_columns()
         else:
             self.view_mode = "individual"
             self.table.show()
@@ -2384,8 +3355,34 @@ class UnifiedTripView(QWidget):
             self._setup_individual_columns()
         self._refresh_table()
 
+    def _setup_by_day_tree_columns(self):
+        """Set up tree columns for By Day view"""
+        self.tree.setHeaderLabels(["Date / Trip", "Trips / Category", "Business", "Personal", "Total / Destination"])
+        self.tree.setColumnWidth(0, 180)
+        self.tree.setColumnWidth(1, 120)
+        self.tree.setColumnWidth(2, 100)
+        self.tree.setColumnWidth(3, 100)
+        self.tree.header().setStretchLastSection(True)
+
+    def _setup_weekly_tree_columns(self):
+        """Set up tree columns for By Week view"""
+        self.tree.setHeaderLabels(["Date / Trip", "Trips / Category", "Business", "Personal", "Total / Destination"])
+        self.tree.setColumnWidth(0, 180)
+        self.tree.setColumnWidth(1, 120)
+        self.tree.setColumnWidth(2, 100)
+        self.tree.setColumnWidth(3, 100)
+        self.tree.header().setStretchLastSection(True)
+
     def load_trips(self, trips: List[Dict]):
         """Load trip data and group by destination"""
+        # Clear existing data first to free memory
+        self.trips_data = []
+        self.grouped_data = []
+        self.day_grouped_data = []
+        self.table.setRowCount(0)
+        self.tree.clear()
+
+        # Now load new data
         self.trips_data = trips
 
         # Group trips by destination address
@@ -2481,6 +3478,42 @@ class UnifiedTripView(QWidget):
             data['trips'] = sorted(data['trips'], key=lambda t: t.get('started'))
             self.day_grouped_data.append(data)
 
+        # Group trips by week
+        week_groups = {}
+        for trip in trips:
+            trip_date = trip.get('started')
+            if not trip_date or not hasattr(trip_date, 'date'):
+                continue
+            # Get week start (Monday)
+            week_start = trip_date - timedelta(days=trip_date.weekday())
+            week_key = week_start.strftime('%Y-%m-%d')
+            if week_key not in week_groups:
+                week_groups[week_key] = {
+                    'week_start': week_start,
+                    'trips': [],
+                    'total_miles': 0,
+                    'business_miles': 0,
+                    'personal_miles': 0,
+                    'commute_miles': 0
+                }
+            week_groups[week_key]['trips'].append(trip)
+            distance = trip.get('distance', 0)
+            week_groups[week_key]['total_miles'] += distance
+            cat = trip.get('computed_category', 'PERSONAL')
+            if cat == 'BUSINESS':
+                week_groups[week_key]['business_miles'] += distance
+            elif cat == 'PERSONAL':
+                week_groups[week_key]['personal_miles'] += distance
+            elif cat == 'COMMUTE':
+                week_groups[week_key]['commute_miles'] += distance
+
+        # Convert to sorted list (most recent first)
+        self.week_grouped_data = []
+        for week_key in sorted(week_groups.keys(), reverse=True):
+            data = week_groups[week_key]
+            data['week_key'] = week_key
+            self.week_grouped_data.append(data)
+
         # Update business filter dropdown
         self._update_business_filter()
         self._refresh_table()
@@ -2527,6 +3560,11 @@ class UnifiedTripView(QWidget):
             self._apply_filters()
             return
 
+        if self.view_mode == "weekly":
+            self._populate_weekly_tree()
+            self._apply_filters()
+            return
+
         self.table.setSortingEnabled(False)
 
         if self.view_mode == "grouped":
@@ -2542,23 +3580,21 @@ class UnifiedTripView(QWidget):
         self.table.setRowCount(len(self.grouped_data))
 
         for row, data in enumerate(self.grouped_data):
-            # Destination address
-            addr_item = QTableWidgetItem(data['address'])
-            addr_item.setData(Qt.ItemDataRole.UserRole, row)  # Store index
-            self.table.setItem(row, 0, addr_item)
-
-            # Business name
+            # Column 0: Business name (most important - what is this place?)
             name = data.get('business_name', '')
             name_item = QTableWidgetItem(name)
+            name_item.setData(Qt.ItemDataRole.UserRole, row)  # Store index for selection
             if data['status'] == 'Unconfirmed Business':
-                name_item.setText('[Unconfirmed]')
+                name_item.setText('[Needs Confirmation]')
                 name_item.setForeground(QColor('#ff8f00'))
                 name_item.setFont(QFont('', -1, -1, True))
             elif data['status'] == 'Needs Name':
-                name_item.setText('')
-            self.table.setItem(row, 1, name_item)
+                name_item.setText('[Unknown]')
+                name_item.setForeground(QColor('#999999'))
+                name_item.setFont(QFont('', -1, -1, True))
+            self.table.setItem(row, 0, name_item)
 
-            # Category
+            # Column 1: Category
             cat = data['primary_category']
             cat_item = QTableWidgetItem(cat)
             if cat == 'BUSINESS':
@@ -2570,44 +3606,91 @@ class UnifiedTripView(QWidget):
             elif cat == 'COMMUTE':
                 cat_item.setBackground(QColor('#e3f2fd'))
                 cat_item.setForeground(QColor('#1565c0'))
-            self.table.setItem(row, 2, cat_item)
+            self.table.setItem(row, 1, cat_item)
 
-            # Trip count (use NumericTableWidgetItem for proper sorting)
+            # Column 2: Trip count
             trip_count = data['trip_count']
             count_item = NumericTableWidgetItem(str(trip_count), trip_count)
-            self.table.setItem(row, 3, count_item)
+            self.table.setItem(row, 2, count_item)
 
-            # Total miles (use NumericTableWidgetItem for proper sorting)
+            # Column 3: Total miles
             total_miles = data['total_miles']
             miles_item = NumericTableWidgetItem(f"{total_miles:.1f}", total_miles)
-            self.table.setItem(row, 4, miles_item)
+            self.table.setItem(row, 3, miles_item)
 
-            # Status
-            status_item = QTableWidgetItem(data['status'])
-            if data['status'] == 'Needs Name':
+            # Column 4: Status
+            status = data['status']
+            if status == 'Needs Name':
+                status_text = 'Needs Name'
+            elif status == 'Unconfirmed Business':
+                status_text = 'Unconfirmed'
+            else:
+                status_text = 'Confirmed'
+            status_item = QTableWidgetItem(status_text)
+            if status == 'Needs Name':
                 status_item.setForeground(QColor('#d32f2f'))
-            elif data['status'] == 'Unconfirmed Business':
+            elif status == 'Unconfirmed Business':
                 status_item.setForeground(QColor('#ff8f00'))
             else:
                 status_item.setForeground(QColor('#388e3c'))
-            self.table.setItem(row, 5, status_item)
+            self.table.setItem(row, 4, status_item)
 
-            # Street
-            self.table.setItem(row, 6, QTableWidgetItem(data.get('street', '')))
+            # Column 5: Destination address
+            addr_item = QTableWidgetItem(data['address'])
+            self.table.setItem(row, 5, addr_item)
 
     def _populate_individual_view(self):
         """Populate table with individual trip data"""
         self.table.setRowCount(len(self.trips_data))
 
         for row, trip in enumerate(self.trips_data):
-            # Date
-            date_str = trip['started'].strftime('%Y-%m-%d %H:%M')
+            # Date - with merge/micro/duplicate indicator if applicable
+            date_str = trip['started'].strftime('%Y-%m-%d')
+            tooltip = None
+            if trip.get('is_duplicate'):
+                date_str = f"⚡ {date_str}"
+                tooltip = "POTENTIAL DUPLICATE: This trip has the same start time and destination as another trip"
+            elif trip.get('is_micro_trip'):
+                date_str = f"⚠ {date_str}"
+                tooltip = f"MICRO-TRIP: {trip.get('micro_reason', 'Very short distance')}\nRight-click for options"
+            elif trip.get('is_merged'):
+                merge_count = trip.get('merge_count', 2)
+                date_str = f"⟨{merge_count}⟩ {date_str}"
+                tooltip = f"This trip was merged from {trip.get('merge_count', 2)} short segments (red lights/traffic stops)"
             date_item = QTableWidgetItem(date_str)
             date_item.setData(Qt.ItemDataRole.UserRole, row)
+            if tooltip:
+                date_item.setToolTip(tooltip)
+            if trip.get('is_duplicate'):
+                date_item.setForeground(QColor('#d32f2f'))  # Red for duplicates
+            elif trip.get('is_micro_trip'):
+                date_item.setForeground(QColor('#ff9800'))  # Orange for micro-trips
             self.table.setItem(row, 0, date_item)
 
             # Day
             self.table.setItem(row, 1, QTableWidgetItem(trip['started'].strftime('%a')))
+
+            # Start time
+            start_time = trip['started'].strftime('%H:%M')
+            self.table.setItem(row, 2, QTableWidgetItem(start_time))
+
+            # End time - parse from 'stopped' field
+            stopped = trip.get('stopped', '')
+            end_time = ''
+            if stopped:
+                try:
+                    # Handle various date formats
+                    from datetime import datetime
+                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%m/%d/%Y %H:%M', '%m/%d/%Y %I:%M %p']:
+                        try:
+                            end_dt = datetime.strptime(stopped, fmt)
+                            end_time = end_dt.strftime('%H:%M')
+                            break
+                        except ValueError:
+                            continue
+                except Exception:
+                    end_time = ''
+            self.table.setItem(row, 3, QTableWidgetItem(end_time))
 
             # Category
             cat = trip.get('computed_category', 'PERSONAL')
@@ -2621,16 +3704,22 @@ class UnifiedTripView(QWidget):
             elif cat == 'COMMUTE':
                 cat_item.setBackground(QColor('#e3f2fd'))
                 cat_item.setForeground(QColor('#1565c0'))
-            self.table.setItem(row, 2, cat_item)
+            self.table.setItem(row, 4, cat_item)
+
+            # Category Reason
+            reason = trip.get('category_reason', '')
+            reason_item = QTableWidgetItem(reason)
+            reason_item.setForeground(QColor('#757575'))  # Gray text
+            self.table.setItem(row, 5, reason_item)
 
             # Distance (use NumericTableWidgetItem for proper sorting)
             dist_val = trip.get('distance', 0)
             dist_item = NumericTableWidgetItem(f"{dist_val:.1f} mi", dist_val)
-            self.table.setItem(row, 3, dist_item)
+            self.table.setItem(row, 6, dist_item)
 
             # From/To
-            self.table.setItem(row, 4, QTableWidgetItem(trip.get('start_address', '')))
-            self.table.setItem(row, 5, QTableWidgetItem(trip.get('end_address', '')))
+            self.table.setItem(row, 7, QTableWidgetItem(trip.get('start_address', '')))
+            self.table.setItem(row, 8, QTableWidgetItem(trip.get('end_address', '')))
 
             # Business name
             name = trip.get('business_name', '')
@@ -2639,7 +3728,16 @@ class UnifiedTripView(QWidget):
                 name_item.setText('[Unconfirmed]')
                 name_item.setForeground(QColor('#ff8f00'))
                 name_item.setFont(QFont('', -1, -1, True))
-            self.table.setItem(row, 6, name_item)
+            self.table.setItem(row, 9, name_item)
+
+            # Notes - load from trip_notes.json
+            notes = load_trip_notes()
+            trip_key = get_trip_key(trip)
+            note_text = notes.get(trip_key, '')
+            note_item = QTableWidgetItem(note_text)
+            if note_text:
+                note_item.setForeground(QColor('#666666'))
+            self.table.setItem(row, 10, note_item)
 
     def _populate_by_day_view(self):
         """Populate table with trips grouped by day"""
@@ -2686,6 +3784,96 @@ class UnifiedTripView(QWidget):
             hint_item.setForeground(QColor('#666666'))
             hint_item.setFont(QFont('', -1, -1, True))
             self.table.setItem(row, 5, hint_item)
+
+    def _populate_weekly_tree(self):
+        """Populate tree widget with expandable weeks containing days and trips"""
+        self.tree.clear()
+
+        if not hasattr(self, 'week_grouped_data'):
+            self.week_grouped_data = []
+
+        for week_data in self.week_grouped_data:
+            week_key = week_data['week_key']
+            trips = week_data['trips']
+            total_miles = week_data['total_miles']
+            biz_miles = week_data['business_miles']
+            biz_pct = (biz_miles / total_miles * 100) if total_miles > 0 else 0
+
+            # Create week item (top level)
+            week_item = QTreeWidgetItem([
+                f"Week of {week_key}",
+                f"{len(trips)} trips",
+                f"{biz_miles:.1f} mi",
+                f"{week_data['personal_miles']:.1f} mi",
+                f"{total_miles:.1f} mi ({biz_pct:.0f}% business)"
+            ])
+            week_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'week', 'data': week_data})
+            week_item.setFont(0, QFont('', -1, QFont.Weight.Bold.value))
+            week_item.setForeground(2, QColor('#2e7d32'))
+            week_item.setForeground(3, QColor('#e65100'))
+
+            # Group trips by day within this week
+            day_groups = {}
+            for trip in trips:
+                trip_date = trip.get('started')
+                if not trip_date:
+                    continue
+                date_key = trip_date.date() if hasattr(trip_date, 'date') else trip_date
+                if date_key not in day_groups:
+                    day_groups[date_key] = []
+                day_groups[date_key].append(trip)
+
+            # Add day items under week
+            for date_key in sorted(day_groups.keys()):
+                day_trips = day_groups[date_key]
+                day_miles = sum(t.get('distance', 0) for t in day_trips)
+                day_biz = sum(t.get('distance', 0) for t in day_trips if t.get('computed_category') == 'BUSINESS')
+                day_personal = sum(t.get('distance', 0) for t in day_trips if t.get('computed_category') == 'PERSONAL')
+
+                date_str = date_key.strftime('%Y-%m-%d (%a)') if hasattr(date_key, 'strftime') else str(date_key)
+                day_item = QTreeWidgetItem([
+                    f"  {date_str}",
+                    f"{len(day_trips)} trips",
+                    f"{day_biz:.1f} mi",
+                    f"{day_personal:.1f} mi",
+                    f"{day_miles:.1f} mi"
+                ])
+                day_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'day', 'trips': day_trips, 'date': date_key})
+                if day_biz > 0:
+                    day_item.setForeground(2, QColor('#2e7d32'))
+                if day_personal > 0:
+                    day_item.setForeground(3, QColor('#e65100'))
+
+                # Add individual trips under day
+                for trip in sorted(day_trips, key=lambda t: t.get('started')):
+                    time_str = trip['started'].strftime('%H:%M') if hasattr(trip['started'], 'strftime') else ''
+                    cat = trip.get('computed_category', 'PERSONAL')
+                    dist = trip.get('distance', 0)
+                    dest = trip.get('end_address', '')[:40]
+                    biz_name = trip.get('business_name', '')
+
+                    trip_item = QTreeWidgetItem([
+                        f"    {time_str}",
+                        cat,
+                        f"{dist:.1f} mi",
+                        biz_name,
+                        dest
+                    ])
+                    trip_item.setData(0, Qt.ItemDataRole.UserRole, {'type': 'trip', 'trip': trip})
+
+                    # Color by category
+                    if cat == 'BUSINESS':
+                        trip_item.setForeground(1, QColor('#2e7d32'))
+                    elif cat == 'PERSONAL':
+                        trip_item.setForeground(1, QColor('#e65100'))
+                    elif cat == 'COMMUTE':
+                        trip_item.setForeground(1, QColor('#1565c0'))
+
+                    day_item.addChild(trip_item)
+
+                week_item.addChild(day_item)
+
+            self.tree.addTopLevelItem(week_item)
 
     def _populate_by_day_tree(self):
         """Populate tree widget with expandable days and trips"""
@@ -2758,13 +3946,24 @@ class UnifiedTripView(QWidget):
             return
 
         if user_data['type'] == 'trip':
-            # Single trip selected - show it on map
-            self.trip_selected.emit(user_data['data'])
+            # Single trip selected - show it on map (handle both 'trip' and 'data' keys)
+            trip = user_data.get('trip') or user_data.get('data')
+            if trip:
+                self.trip_selected.emit(trip)
         elif user_data['type'] == 'day':
-            # Day selected - show all trips for that day
-            day_data = user_data['data']
-            if day_data['trips']:
-                self.show_daily_journey.emit(day_data['trips'])
+            # Day selected - show all trips for that day (handle both formats)
+            trips = user_data.get('trips', [])
+            if not trips:
+                day_data = user_data.get('data', {})
+                trips = day_data.get('trips', [])
+            if trips:
+                self.show_daily_journey.emit(trips)
+        elif user_data['type'] == 'week':
+            # Week selected - show all trips for that week
+            week_data = user_data.get('data', {})
+            trips = week_data.get('trips', [])
+            if trips:
+                self.show_daily_journey.emit(trips)
 
     def _on_tree_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         """Handle double click on tree item - expand/collapse or show route"""
@@ -2776,8 +3975,10 @@ class UnifiedTripView(QWidget):
             # Toggle expansion
             item.setExpanded(not item.isExpanded())
         elif user_data['type'] == 'trip':
-            # Show trip on map
-            self.trip_selected.emit(user_data['data'])
+            # Show trip on map (handle both 'trip' and 'data' keys)
+            trip = user_data.get('trip') or user_data.get('data')
+            if trip:
+                self.trip_selected.emit(trip)
 
     def _on_tree_item_expanded(self, item: QTreeWidgetItem):
         """Handle tree item expansion"""
@@ -2795,13 +3996,167 @@ class UnifiedTripView(QWidget):
             return
 
         if user_data['type'] == 'trip':
-            # Show single trip on map
-            self.trip_selected.emit(user_data['data'])
+            # Show single trip on map - handle both 'trip' and 'data' keys for compatibility
+            trip = user_data.get('trip') or user_data.get('data')
+            if trip:
+                self.trip_selected.emit(trip)
         elif user_data['type'] == 'day':
-            # Show all trips for the day
-            day_data = user_data['data']
-            if day_data.get('trips'):
-                self.show_daily_journey.emit(day_data['trips'])
+            # Show all trips for the day - handle both formats
+            # Weekly view: {'type': 'day', 'trips': [...]}
+            # By-day view: {'type': 'day', 'data': {'trips': [...]}}
+            trips = user_data.get('trips')
+            if not trips:
+                day_data = user_data.get('data', {})
+                trips = day_data.get('trips', [])
+            if trips:
+                self.show_daily_journey.emit(trips)
+
+    def _show_tree_context_menu(self, pos):
+        """Show context menu for tree widget items"""
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+
+        user_data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not user_data:
+            return
+
+        menu = QMenu(self)
+        item_type = user_data.get('type', '')
+
+        # Get the trip(s) for this item
+        trips = []
+        if item_type == 'trip':
+            trip = user_data.get('trip') or user_data.get('data')
+            trips = [trip] if trip else []
+        elif item_type == 'day':
+            # Handle both formats: {'trips': [...]} or {'data': {'trips': [...]}}
+            trips = user_data.get('trips', [])
+            if not trips:
+                day_data = user_data.get('data', {})
+                trips = day_data.get('trips', [])
+        elif item_type == 'week':
+            week_data = user_data.get('data', {})
+            trips = week_data.get('trips', [])
+
+        if not trips:
+            return
+
+        # Assign name submenu
+        assign_menu = menu.addMenu("Assign Name")
+        home_action = assign_menu.addAction("Home")
+        office_action = assign_menu.addAction("Office")
+        personal_action = assign_menu.addAction("[PERSONAL]")
+        assign_menu.addSeparator()
+
+        # Existing names - alphabetical groups
+        existing_names = self._get_existing_business_names()
+        name_actions = {}
+        if existing_names:
+            existing_menu = assign_menu.addMenu("Existing Names")
+            sorted_names = sorted(existing_names, key=str.lower)
+            alpha_groups = [
+                ('A-C', 'ABC'), ('D-F', 'DEF'), ('G-I', 'GHI'), ('J-L', 'JKL'),
+                ('M-O', 'MNO'), ('P-R', 'PQR'), ('S-U', 'STU'), ('V-Z', 'VWXYZ'),
+                ('#', '0123456789')
+            ]
+            for group_label, letters in alpha_groups:
+                group_names = [n for n in sorted_names if n and n[0].upper() in letters]
+                if group_names:
+                    group_menu = existing_menu.addMenu(f"{group_label} ({len(group_names)})")
+                    for name in group_names:
+                        action = group_menu.addAction(name)
+                        name_actions[action] = name
+            assign_menu.addSeparator()
+
+        custom_action = assign_menu.addAction("Custom Name...")
+        menu.addSeparator()
+
+        # Category submenu
+        cat_menu = menu.addMenu("Set Category")
+        business_action = cat_menu.addAction("Business")
+        personal_cat_action = cat_menu.addAction("Personal")
+        commute_action = cat_menu.addAction("Commute")
+        menu.addSeparator()
+
+        # Add/Edit Note (only for single trip)
+        edit_note_action = None
+        if item_type == 'trip' and len(trips) == 1:
+            edit_note_action = menu.addAction("Add/Edit Note...")
+            menu.addSeparator()
+
+        # Map actions
+        view_map_action = menu.addAction("View on Map")
+        show_day_action = menu.addAction("Show Day's Journey")
+
+        action = menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+        if action == home_action:
+            self._apply_name_to_trips(trips, "Home")
+        elif action == office_action:
+            self._apply_name_to_trips(trips, "Office")
+        elif action == personal_action:
+            self._apply_name_to_trips(trips, "[PERSONAL]")
+        elif action == custom_action:
+            self._prompt_custom_name_for_trips(trips)
+        elif action in name_actions:
+            self._apply_name_to_trips(trips, name_actions[action])
+        elif action == business_action:
+            self._apply_category_to_trips(trips, "BUSINESS")
+        elif action == personal_cat_action:
+            self._apply_category_to_trips(trips, "PERSONAL")
+        elif action == commute_action:
+            self._apply_category_to_trips(trips, "COMMUTE")
+        elif action == edit_note_action and trips:
+            self._edit_note_for_trip(trips[0])
+        elif action == view_map_action and trips:
+            self.trip_selected.emit(trips[0])
+        elif action == show_day_action and trips:
+            self.show_daily_journey.emit(trips)
+
+    def _apply_name_to_trips(self, trips: list, name: str):
+        """Apply business name directly to a list of trips"""
+        for trip in trips:
+            trip['business_name'] = name
+            addr = trip.get('end_address', '')
+            if addr:
+                cat = trip.get('computed_category')
+                self._save_business_mapping(addr, name, cat)
+        self.mapping_changed.emit()
+        self._refresh_table()
+
+    def _prompt_custom_name_for_trips(self, trips: list):
+        """Prompt for custom name for trips"""
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "Custom Business Name",
+            f"Enter name for {len(trips)} trip(s):"
+        )
+        if ok and name.strip():
+            self._apply_name_to_trips(trips, name.strip())
+
+    def _apply_category_to_trips(self, trips: list, category: str):
+        """Apply category directly to a list of trips"""
+        for trip in trips:
+            trip['computed_category'] = category
+            trip['auto_category'] = category.lower()
+        self.trip_updated.emit({}, 'category', category)
+        self._refresh_table()
+
+    def _edit_note_for_trip(self, trip: dict):
+        """Edit note for a single trip"""
+        trip_key = get_trip_key(trip)
+        notes = load_trip_notes()
+        current_note = notes.get(trip_key, '')
+
+        trip_info = f"{trip['started'].strftime('%Y-%m-%d %H:%M')} - {trip.get('end_address', '')[:60]}"
+        dialog = NoteDialog(trip_info, current_note, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            success, msg = save_trip_note(trip, dialog.get_note())
+            if success:
+                self._refresh_table()
+            else:
+                QMessageBox.warning(self, "Save Error", msg)
 
     def _apply_filters(self):
         """Apply all filters to the table or tree"""
@@ -2809,10 +4164,11 @@ class UnifiedTripView(QWidget):
         status = self.status_filter.currentText()
         business = self.business_filter.currentText()
         search = self.search_box.text().lower()
+        hide_micro = self.hide_micro_trips.isChecked()
 
-        # Auto-switch to All Trips view when filtering by Unresolved
+        # Auto-switch to All Trips view when filtering by Unresolved or Duplicates
         # because grouped view hides individual unresolved trips
-        if status == "Unresolved" and self.view_mode == "grouped":
+        if status in ["Unresolved", "Duplicates"] and self.view_mode == "grouped":
             self.view_mode_combo.setCurrentText("All Trips")
             return  # setCurrentText triggers _on_view_mode_changed which calls _apply_filters
 
@@ -2840,6 +4196,10 @@ class UnifiedTripView(QWidget):
                     trip = trip_data.get('data', {})
 
                     show_trip = True
+
+                    # Micro-trip filter
+                    if hide_micro and trip.get('is_micro_trip'):
+                        show_trip = False
 
                     # Category filter
                     if category != "All" and trip.get('computed_category', '') != category.upper():
@@ -2885,7 +4245,7 @@ class UnifiedTripView(QWidget):
                             show = False
                         elif status == "Resolved" and data['status'] != 'Has Name':
                             show = False
-                        elif status == "Unconfirmed Business" and data['status'] != 'Unconfirmed Business':
+                        elif status == "Unconfirmed" and data['status'] != 'Unconfirmed Business':
                             show = False
                     # Business name filter
                     if business != "All":
@@ -2902,6 +4262,9 @@ class UnifiedTripView(QWidget):
             else:
                 trip = self.trips_data[data_index] if data_index < len(self.trips_data) else None
                 if trip:
+                    # Micro-trip filter
+                    if hide_micro and trip.get('is_micro_trip'):
+                        show = False
                     # Category filter
                     if category != "All" and trip.get('computed_category', '') != category.upper():
                         show = False
@@ -2909,11 +4272,14 @@ class UnifiedTripView(QWidget):
                     if status != "All":
                         has_name = bool(trip.get('business_name', ''))
                         is_business = trip.get('computed_category') == 'BUSINESS'
+                        is_duplicate = trip.get('is_duplicate', False)
                         if status == "Unresolved" and has_name:
                             show = False
                         elif status == "Resolved" and not has_name:
                             show = False
-                        elif status == "Unconfirmed Business" and not (is_business and not has_name):
+                        elif status == "Unconfirmed" and not (is_business and not has_name):
+                            show = False
+                        elif status == "Duplicates" and not is_duplicate:
                             show = False
                     # Business name filter
                     if business != "All":
@@ -3019,24 +4385,34 @@ class UnifiedTripView(QWidget):
             data['business_name'] = name
             data['status'] = 'Has Name' if name else ('Unconfirmed Business' if data['primary_category'] == 'BUSINESS' else 'Needs Name')
 
-            # Update table cell
-            name_item = self.table.item(row, 1)
+            # Update table cell (column 0 = Business Name in grouped view)
+            name_item = self.table.item(row, 0)
             if name_item:
                 if name:
                     name_item.setText(name)
                     name_item.setForeground(QColor('#000000'))
                     name_item.setFont(QFont())
                 elif data['status'] == 'Unconfirmed Business':
-                    name_item.setText('[Unconfirmed]')
+                    name_item.setText('[Needs Confirmation]')
                     name_item.setForeground(QColor('#ff8f00'))
                     name_item.setFont(QFont('', -1, -1, True))
                 else:
-                    name_item.setText('')
+                    name_item.setText('[Unknown]')
+                    name_item.setForeground(QColor('#999999'))
+                    name_item.setFont(QFont('', -1, -1, True))
 
-            # Update status cell
-            status_item = self.table.item(row, 5)
+            # Update status cell (column 4 = Status in grouped view)
+            status_item = self.table.item(row, 4)
             if status_item:
-                status_item.setText(data['status'])
+                if data['status'] == 'Needs Name':
+                    status_item.setText('Needs Name')
+                    status_item.setForeground(QColor('#d32f2f'))
+                elif data['status'] == 'Unconfirmed Business':
+                    status_item.setText('Unconfirmed')
+                    status_item.setForeground(QColor('#ff8f00'))
+                else:
+                    status_item.setText('Confirmed')
+                    status_item.setForeground(QColor('#388e3c'))
 
             # Save to mapping file
             if name:
@@ -3064,8 +4440,8 @@ class UnifiedTripView(QWidget):
             data['primary_category'] = category
             data['status'] = 'Has Name' if data.get('business_name') else ('Unconfirmed Business' if category == 'BUSINESS' else 'Needs Name')
 
-            # Update table
-            cat_item = self.table.item(row, 2)
+            # Update table (column 1 = Category in grouped view)
+            cat_item = self.table.item(row, 1)
             if cat_item:
                 cat_item.setText(category)
                 if category == 'BUSINESS':
@@ -3093,7 +4469,8 @@ class UnifiedTripView(QWidget):
 
         if ok:
             trip['business_name'] = name
-            name_item = self.table.item(row, 6)
+            # Column 8 = Business Name in individual view
+            name_item = self.table.item(row, 8)
             if name_item:
                 name_item.setText(name if name else '[Unconfirmed]' if trip.get('computed_category') == 'BUSINESS' else '')
 
@@ -3115,7 +4492,8 @@ class UnifiedTripView(QWidget):
 
         if ok and category != current:
             trip['computed_category'] = category
-            cat_item = self.table.item(row, 2)
+            # Column 4 = Category in individual view
+            cat_item = self.table.item(row, 4)
             if cat_item:
                 cat_item.setText(category)
                 if category == 'BUSINESS':
@@ -3156,14 +4534,31 @@ class UnifiedTripView(QWidget):
         personal_action = assign_menu.addAction("[PERSONAL]")
         assign_menu.addSeparator()
 
-        # Existing names
+        # Existing names - organized alphabetically
         existing_names = self._get_existing_business_names()
         name_actions = {}
         if existing_names:
-            recent_menu = assign_menu.addMenu("Existing Names")
-            for name in sorted(existing_names)[:15]:
-                action = recent_menu.addAction(name)
-                name_actions[action] = name
+            existing_menu = assign_menu.addMenu("Existing Names")
+            # Group names alphabetically (A-C, D-F, etc.)
+            sorted_names = sorted(existing_names, key=str.lower)
+            alpha_groups = [
+                ('A-C', 'ABC'),
+                ('D-F', 'DEF'),
+                ('G-I', 'GHI'),
+                ('J-L', 'JKL'),
+                ('M-O', 'MNO'),
+                ('P-R', 'PQR'),
+                ('S-U', 'STU'),
+                ('V-Z', 'VWXYZ'),
+                ('#', '0123456789')
+            ]
+            for group_label, letters in alpha_groups:
+                group_names = [n for n in sorted_names if n and n[0].upper() in letters]
+                if group_names:
+                    group_menu = existing_menu.addMenu(f"{group_label} ({len(group_names)})")
+                    for name in group_names:
+                        action = group_menu.addAction(name)
+                        name_actions[action] = name
             assign_menu.addSeparator()
 
         custom_action = assign_menu.addAction("Custom Name...")
@@ -3182,6 +4577,30 @@ class UnifiedTripView(QWidget):
         select_nearby_action = None
         if self.view_mode == "grouped":
             select_nearby_action = menu.addAction("Select Nearby...")
+            menu.addSeparator()
+
+        # Add/Edit Note (only in individual view for single selection)
+        edit_note_action = None
+        view_merged_action = None
+        micro_merge_prev_action = None
+        micro_merge_next_action = None
+        micro_mark_valid_action = None
+        micro_discard_action = None
+        if self.view_mode == "individual" and len(selected_rows) == 1:
+            edit_note_action = menu.addAction("Add/Edit Note...")
+            # Check if this is a merged trip
+            trip = self.trips_data[row] if row < len(self.trips_data) else None
+            if trip and trip.get('is_merged'):
+                view_merged_action = menu.addAction("View Merged Details...")
+            # Check if this is a micro-trip
+            if trip and trip.get('is_micro_trip'):
+                menu.addSeparator()
+                micro_menu = menu.addMenu("Micro-Trip Options")
+                micro_merge_prev_action = micro_menu.addAction("Merge with Previous Trip")
+                micro_merge_next_action = micro_menu.addAction("Merge with Next Trip")
+                micro_menu.addSeparator()
+                micro_mark_valid_action = micro_menu.addAction("Mark as Valid Trip")
+                micro_discard_action = micro_menu.addAction("Discard Trip")
             menu.addSeparator()
 
         # Map actions
@@ -3209,6 +4628,18 @@ class UnifiedTripView(QWidget):
             self._apply_category_to_selected(selected_rows, "COMMUTE")
         elif action == select_nearby_action:
             self._select_nearby(row)
+        elif action == edit_note_action:
+            self._edit_trip_note(row)
+        elif action == view_merged_action:
+            self._view_merged_details(row)
+        elif action == micro_merge_prev_action:
+            self._merge_micro_trip(row, merge_with='previous')
+        elif action == micro_merge_next_action:
+            self._merge_micro_trip(row, merge_with='next')
+        elif action == micro_mark_valid_action:
+            self._mark_micro_trip_valid(row)
+        elif action == micro_discard_action:
+            self._discard_micro_trip(row)
         elif action == view_map_action:
             self._view_on_map(row)
         elif action == show_day_action:
@@ -3216,21 +4647,34 @@ class UnifiedTripView(QWidget):
         elif action == open_gmaps_action:
             self._open_in_google_maps(row)
 
-    def _apply_name_to_selected(self, data_indices: List[int], name: str):
-        """Apply business name to selected rows (data_indices are original data indices)"""
+    def _apply_name_to_selected(self, data_indices: List[int], name: str, category: str = None):
+        """Apply business name to selected rows (data_indices are original data indices)
+
+        If category is provided, it will be saved with the mapping for future use.
+        """
         for data_index in data_indices:
             if self.view_mode == "grouped" and data_index < len(self.grouped_data):
                 data = self.grouped_data[data_index]
+                trip_category = category or data.get('primary_category')
                 for trip in data['trips']:
                     trip['business_name'] = name
                 data['business_name'] = name
                 data['status'] = 'Has Name'
-                self._save_business_mapping(data['address'], name)
+                self._save_business_mapping(data['address'], name, trip_category)
 
             elif self.view_mode == "individual" and data_index < len(self.trips_data):
                 trip = self.trips_data[data_index]
+                trip_category = category or trip.get('computed_category')
                 trip['business_name'] = name
-                self._save_business_mapping(trip.get('end_address', ''), name)
+                self._save_business_mapping(trip.get('end_address', ''), name, trip_category)
+
+            elif self.view_mode == "by_day" and data_index < len(self.day_grouped_data):
+                # For by_day view, apply to all trips on that day
+                day_data = self.day_grouped_data[data_index]
+                for trip in day_data.get('trips', []):
+                    trip_category = category or trip.get('computed_category')
+                    trip['business_name'] = name
+                    self._save_business_mapping(trip.get('end_address', ''), name, trip_category)
 
         self.mapping_changed.emit()
         self._update_business_filter()
@@ -3246,6 +4690,137 @@ class UnifiedTripView(QWidget):
         if ok and name.strip():
             self._apply_name_to_selected(rows, name.strip())
 
+    def _edit_trip_note(self, data_index: int):
+        """Edit note for a trip (individual view only)"""
+        if self.view_mode != "individual" or data_index >= len(self.trips_data):
+            return
+
+        trip = self.trips_data[data_index]
+        trip_key = get_trip_key(trip)
+        notes = load_trip_notes()
+        current_note = notes.get(trip_key, '')
+
+        trip_info = f"{trip['started'].strftime('%Y-%m-%d %H:%M')} - {trip.get('end_address', '')[:60]}"
+        dialog = NoteDialog(trip_info, current_note, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            success, msg = save_trip_note(trip, dialog.get_note())
+            if success:
+                self._refresh_table()
+            else:
+                QMessageBox.warning(self, "Save Error", msg)
+
+    def _view_merged_details(self, data_index: int):
+        """Show details of a merged trip"""
+        if self.view_mode != "individual" or data_index >= len(self.trips_data):
+            return
+
+        trip = self.trips_data[data_index]
+        if not trip.get('is_merged') or 'merged_from' not in trip:
+            return
+
+        merged_from = trip['merged_from']
+
+        # Build details text
+        details = "This trip was automatically merged from the following short segments:\n"
+        details += "(Likely caused by stopping at red lights or in traffic)\n\n"
+
+        total_distance = 0
+        for i, segment in enumerate(merged_from, 1):
+            details += f"Segment {i}:\n"
+            details += f"  Started: {segment.get('started', 'N/A')}\n"
+            details += f"  Stopped: {segment.get('stopped', 'N/A')}\n"
+            details += f"  Distance: {segment.get('distance', 0):.2f} mi\n"
+            details += f"  From: {segment.get('start_address', 'N/A')}\n"
+            details += f"  To: {segment.get('end_address', 'N/A')}\n\n"
+            total_distance += segment.get('distance', 0)
+
+        details += f"Combined Distance: {total_distance:.2f} mi"
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Merged Trip Details")
+        msg.setText(f"Trip merged from {len(merged_from)} segments")
+        msg.setDetailedText(details)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec()
+
+    def _merge_micro_trip(self, data_index: int, merge_with: str):
+        """Merge a micro-trip with the previous or next trip"""
+        if self.view_mode != "individual" or data_index >= len(self.trips_data):
+            return
+
+        trip = self.trips_data[data_index]
+
+        # Find the trip to merge with
+        if merge_with == 'previous' and data_index > 0:
+            target_index = data_index - 1
+            target_trip = self.trips_data[target_index]
+            # Add micro-trip's distance to target
+            target_trip['distance'] = target_trip.get('distance', 0) + trip.get('distance', 0)
+            # Update end address/time to micro-trip's end
+            target_trip['end_address'] = trip.get('end_address', target_trip.get('end_address'))
+            target_trip['stopped'] = trip.get('stopped', target_trip.get('stopped'))
+            target_trip['end_odometer'] = trip.get('end_odometer', target_trip.get('end_odometer'))
+            # Mark as merged
+            target_trip['is_merged'] = True
+            target_trip['merge_count'] = target_trip.get('merge_count', 1) + 1
+            # Remove the micro-trip
+            self.trips_data.pop(data_index)
+            self.trip_updated.emit({}, 'merge', 'previous')
+
+        elif merge_with == 'next' and data_index < len(self.trips_data) - 1:
+            target_index = data_index + 1
+            target_trip = self.trips_data[target_index]
+            # Add micro-trip's distance to target
+            target_trip['distance'] = target_trip.get('distance', 0) + trip.get('distance', 0)
+            # Update start address/time to micro-trip's start
+            target_trip['start_address'] = trip.get('start_address', target_trip.get('start_address'))
+            target_trip['started'] = trip.get('started', target_trip.get('started'))
+            target_trip['start_odometer'] = trip.get('start_odometer', target_trip.get('start_odometer'))
+            # Mark as merged
+            target_trip['is_merged'] = True
+            target_trip['merge_count'] = target_trip.get('merge_count', 1) + 1
+            # Remove the micro-trip
+            self.trips_data.pop(data_index)
+            self.trip_updated.emit({}, 'merge', 'next')
+
+        else:
+            QMessageBox.warning(self, "Cannot Merge",
+                f"No {'previous' if merge_with == 'previous' else 'next'} trip to merge with.")
+            return
+
+        self._refresh_table()
+
+    def _mark_micro_trip_valid(self, data_index: int):
+        """Mark a micro-trip as a valid trip (remove the flag)"""
+        if self.view_mode != "individual" or data_index >= len(self.trips_data):
+            return
+
+        trip = self.trips_data[data_index]
+        trip['is_micro_trip'] = False
+        trip.pop('micro_reason', None)
+        self._refresh_table()
+
+    def _discard_micro_trip(self, data_index: int):
+        """Discard (remove) a micro-trip from the analysis"""
+        if self.view_mode != "individual" or data_index >= len(self.trips_data):
+            return
+
+        trip = self.trips_data[data_index]
+        reply = QMessageBox.question(
+            self, "Discard Trip",
+            f"Are you sure you want to discard this trip?\n\n"
+            f"Date: {trip['started'].strftime('%Y-%m-%d %H:%M')}\n"
+            f"Distance: {trip.get('distance', 0):.2f} mi\n"
+            f"From: {trip.get('start_address', 'N/A')}\n"
+            f"To: {trip.get('end_address', 'N/A')}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            self.trips_data.pop(data_index)
+            self.trip_updated.emit({}, 'discard', None)
+            self._refresh_table()
+
     def _apply_category_to_selected(self, data_indices: List[int], category: str):
         """Apply category to selected rows (data_indices are original data indices)"""
         for data_index in data_indices:
@@ -3253,11 +4828,20 @@ class UnifiedTripView(QWidget):
                 data = self.grouped_data[data_index]
                 for trip in data['trips']:
                     trip['computed_category'] = category
+                    trip['auto_category'] = category.lower()
                 data['primary_category'] = category
 
             elif self.view_mode == "individual" and data_index < len(self.trips_data):
                 trip = self.trips_data[data_index]
                 trip['computed_category'] = category
+                trip['auto_category'] = category.lower()
+
+            elif self.view_mode == "by_day" and data_index < len(self.day_grouped_data):
+                # For by_day view, apply to all trips on that day
+                day_data = self.day_grouped_data[data_index]
+                for trip in day_data.get('trips', []):
+                    trip['computed_category'] = category
+                    trip['auto_category'] = category.lower()
 
         self.trip_updated.emit({}, 'category', category)
         self._refresh_table()
@@ -3403,6 +4987,10 @@ class UnifiedTripView(QWidget):
                 self.trip_selected.emit(data['trips'][0])
         elif self.view_mode == "individual" and row < len(self.trips_data):
             self.trip_selected.emit(self.trips_data[row])
+        elif self.view_mode == "by_day" and row < len(self.day_grouped_data):
+            day_data = self.day_grouped_data[row]
+            if day_data.get('trips'):
+                self.trip_selected.emit(day_data['trips'][0])
 
     def _open_in_google_maps(self, row: int):
         """Open in external Google Maps"""
@@ -3412,6 +5000,10 @@ class UnifiedTripView(QWidget):
             addr = self.grouped_data[row]['address']
         elif self.view_mode == "individual" and row < len(self.trips_data):
             addr = self.trips_data[row].get('end_address', '')
+        elif self.view_mode == "by_day" and row < len(self.day_grouped_data):
+            day_data = self.day_grouped_data[row]
+            if day_data.get('trips'):
+                addr = day_data['trips'][0].get('end_address', '')
 
         if addr:
             url = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr)}"
@@ -3420,14 +5012,17 @@ class UnifiedTripView(QWidget):
     def _show_day_journey(self, row: int):
         """Show all trips for the same day as the selected trip"""
         trip_date = None
-        
+
         if self.view_mode == "grouped" and row < len(self.grouped_data):
             data = self.grouped_data[row]
             if data['trips']:
                 trip_date = data['trips'][0].get('started')
         elif self.view_mode == "individual" and row < len(self.trips_data):
             trip_date = self.trips_data[row].get('started')
-        
+        elif self.view_mode == "by_day" and row < len(self.day_grouped_data):
+            day_data = self.day_grouped_data[row]
+            trip_date = day_data.get('date')
+
         if trip_date:
             # Find all trips on the same date
             target_date = trip_date.date() if hasattr(trip_date, 'date') else trip_date
@@ -3439,12 +5034,17 @@ class UnifiedTripView(QWidget):
             if day_trips:
                 self.show_daily_journey.emit(day_trips)
 
-    def _save_business_mapping(self, address: str, name: str):
-        """Save business mapping to file"""
+    def _save_business_mapping(self, address: str, name: str, category: str = None):
+        """Save business mapping to unified file with optional category
+
+        Format: {address: {"name": name, "category": category, "source": "manual"}}
+        """
         if not address or not name:
             return
 
         mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+
+        # Load existing mapping
         mappings = {}
         if os.path.exists(mapping_file):
             try:
@@ -3453,7 +5053,17 @@ class UnifiedTripView(QWidget):
             except:
                 pass
 
-        mappings[address] = name
+        # Build entry with source=manual
+        entry = {"name": name, "source": "manual"}
+        if category:
+            entry["category"] = category
+        else:
+            # Check if existing entry has category to preserve it
+            existing = mappings.get(address)
+            if isinstance(existing, dict) and existing.get('category'):
+                entry["category"] = existing['category']
+
+        mappings[address] = entry
 
         try:
             with open(mapping_file, 'w', encoding='utf-8') as f:
@@ -3462,7 +5072,7 @@ class UnifiedTripView(QWidget):
             pass
 
     def _get_existing_business_names(self) -> set:
-        """Get existing business names"""
+        """Get existing business names from mappings"""
         names = set()
         skip = {'Home', 'Office', '[PERSONAL]', 'Unknown', '', 'NO_BUSINESS_FOUND'}
 
@@ -3470,18 +5080,12 @@ class UnifiedTripView(QWidget):
         if os.path.exists(mapping_file):
             try:
                 with open(mapping_file, 'r', encoding='utf-8') as f:
-                    for name in json.load(f).values():
-                        if name and name not in skip:
-                            names.add(name)
-            except:
-                pass
-
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    for entry in json.load(f).values():
-                        name = entry.get('name', '') if isinstance(entry, dict) else str(entry)
+                    for value in json.load(f).values():
+                        # Handle both old format (string) and new format (dict)
+                        if isinstance(value, dict):
+                            name = value.get('name', '')
+                        else:
+                            name = value
                         if name and name not in skip:
                             names.add(name)
             except:
@@ -3618,14 +5222,24 @@ class TripTableWidget(QTableWidget):
         office_action = assign_menu.addAction("Office")
         assign_menu.addSeparator()
 
-        # Add existing business names from mapping
+        # Add existing business names from mapping - organized alphabetically
         existing_names = self._get_existing_business_names()
         name_actions = {}
         if existing_names:
-            recent_menu = assign_menu.addMenu("Existing Names")
-            for name in sorted(existing_names)[:15]:
-                action = recent_menu.addAction(name)
-                name_actions[action] = name
+            existing_menu = assign_menu.addMenu("Existing Names")
+            sorted_names = sorted(existing_names, key=str.lower)
+            alpha_groups = [
+                ('A-C', 'ABC'), ('D-F', 'DEF'), ('G-I', 'GHI'), ('J-L', 'JKL'),
+                ('M-O', 'MNO'), ('P-R', 'PQR'), ('S-U', 'STU'), ('V-Z', 'VWXYZ'),
+                ('#', '0123456789')
+            ]
+            for group_label, letters in alpha_groups:
+                group_names = [n for n in sorted_names if n and n[0].upper() in letters]
+                if group_names:
+                    group_menu = existing_menu.addMenu(f"{group_label} ({len(group_names)})")
+                    for name in group_names:
+                        action = group_menu.addAction(name)
+                        name_actions[action] = name
             assign_menu.addSeparator()
 
         custom_action = assign_menu.addAction("Custom Name...")
@@ -3767,14 +5381,15 @@ class TripTableWidget(QTableWidget):
         # Emit signal for parent to update stats
         self.trip_updated.emit(trip, 'category', new_category)
 
-    def _save_business_mapping(self, address: str, name: str):
-        """Save a business name mapping to the mapping file"""
+    def _save_business_mapping(self, address: str, name: str, category: str = None):
+        """Save a business name mapping to the unified mapping file"""
         if not address or not name:
             return
 
         mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
-        mappings = {}
 
+        # Load existing mapping
+        mappings = {}
         if os.path.exists(mapping_file):
             try:
                 with open(mapping_file, 'r', encoding='utf-8') as f:
@@ -3782,7 +5397,12 @@ class TripTableWidget(QTableWidget):
             except:
                 pass
 
-        mappings[address] = name
+        # Build entry with source=manual
+        entry = {"name": name, "source": "manual"}
+        if category:
+            entry["category"] = category
+
+        mappings[address] = entry
 
         try:
             with open(mapping_file, 'w', encoding='utf-8') as f:
@@ -3861,12 +5481,290 @@ class MileageAnalyzerGUI(QMainWindow):
         super().__init__()
         self.current_file = None
         self.analysis_data = None
+        self._undo_stack = []  # Stack of (address, old_mapping) tuples
+        self._redo_stack = []  # Stack of (address, old_mapping) tuples
         self._setup_ui()
         self._setup_menu()
+        self._restore_window_state()
 
     def _setup_ui(self):
         self.setWindowTitle("Mileage Analyzer")
         self.setMinimumSize(1200, 800)
+        self.resize(1400, 900)  # Default size slightly larger than minimum
+
+        # Apply modern stylesheet
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:pressed {
+                background-color: #0d47a1;
+            }
+            QPushButton:disabled {
+                background-color: #bdbdbd;
+                color: #757575;
+            }
+            QPushButton#exportBtn {
+                background-color: #388e3c;
+            }
+            QPushButton#exportBtn:hover {
+                background-color: #2e7d32;
+            }
+            QDateEdit {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+            }
+            QDateEdit:focus {
+                border-color: #1976d2;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background: white;
+            }
+            QTabBar::tab {
+                background: #e0e0e0;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: white;
+                border-bottom: 2px solid #1976d2;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #eeeeee;
+            }
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background: #e0e0e0;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #1976d2;
+                border-radius: 4px;
+            }
+            QStatusBar {
+                background: #fafafa;
+                border-top: 1px solid #e0e0e0;
+            }
+            QComboBox {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+                min-width: 120px;
+            }
+            QComboBox:focus {
+                border-color: #1976d2;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background: white;
+                border: 1px solid #ccc;
+                selection-background-color: #e3f2fd;
+                selection-color: #1976d2;
+                padding: 4px;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 6px 8px;
+                min-height: 20px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background: #f5f5f5;
+            }
+            QLineEdit {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+            }
+            QLineEdit:focus {
+                border-color: #1976d2;
+            }
+            QSplitter::handle {
+                background: #e0e0e0;
+            }
+            QSplitter::handle:horizontal {
+                width: 3px;
+            }
+            QSplitter::handle:hover {
+                background: #1976d2;
+            }
+            QToolTip {
+                background-color: #424242;
+                color: white;
+                border: none;
+                padding: 5px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            /* Modern flat table styling */
+            QTableWidget {
+                background-color: white;
+                alternate-background-color: #fafafa;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                gridline-color: #f0f0f0;
+                selection-background-color: #e3f2fd;
+                selection-color: #1976d2;
+            }
+            QTableWidget::item {
+                padding: 8px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background-color: #1976d2;
+                color: white;
+            }
+            QTableWidget::item:hover:!selected {
+                background-color: #f5f5f5;
+            }
+            QHeaderView::section {
+                background-color: #fafafa;
+                color: #424242;
+                padding: 10px 8px;
+                border: none;
+                border-bottom: 2px solid #e0e0e0;
+                border-right: 1px solid #f0f0f0;
+                font-weight: bold;
+            }
+            QHeaderView::section:hover {
+                background-color: #f0f0f0;
+            }
+            QHeaderView::section:pressed {
+                background-color: #e0e0e0;
+            }
+            /* Modern flat tree widget styling */
+            QTreeWidget {
+                background-color: white;
+                alternate-background-color: #fafafa;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                selection-background-color: #e3f2fd;
+                selection-color: #1976d2;
+            }
+            QTreeWidget::item {
+                padding: 6px 4px;
+                border: none;
+            }
+            QTreeWidget::item:selected {
+                background-color: #1976d2;
+                color: white;
+            }
+            QTreeWidget::item:hover:!selected {
+                background-color: #f5f5f5;
+            }
+            QTreeWidget::branch {
+                background: transparent;
+            }
+            QTreeWidget::branch:has-children:!has-siblings:closed,
+            QTreeWidget::branch:closed:has-children:has-siblings {
+                border-image: none;
+                image: none;
+            }
+            QTreeWidget::branch:open:has-children:!has-siblings,
+            QTreeWidget::branch:open:has-children:has-siblings {
+                border-image: none;
+                image: none;
+            }
+            /* Context menu styling */
+            QMenu {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 4px 0px;
+            }
+            QMenu::item {
+                padding: 8px 24px;
+                border: none;
+            }
+            QMenu::item:selected {
+                background-color: #e3f2fd;
+                color: #1976d2;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #e0e0e0;
+                margin: 4px 8px;
+            }
+            /* Scrollbar styling */
+            QScrollBar:vertical {
+                background: #fafafa;
+                width: 12px;
+                border: none;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #bdbdbd;
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #9e9e9e;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                background: #fafafa;
+                height: 12px;
+                border: none;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #bdbdbd;
+                border-radius: 6px;
+                min-width: 30px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #9e9e9e;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            /* Group box styling */
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                margin-top: 12px;
+                padding-top: 8px;
+                background: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #424242;
+            }
+        """)
 
         # Central widget
         central = QWidget()
@@ -3920,8 +5818,8 @@ class MileageAnalyzerGUI(QMainWindow):
 
         main_layout.addWidget(splitter)
 
-        # Set initial sizes (left=40%, right=60%)
-        splitter.setSizes([480, 720])
+        # Set initial sizes (50/50 split)
+        splitter.setSizes([600, 600])
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -3933,46 +5831,144 @@ class MileageAnalyzerGUI(QMainWindow):
         self.progress_bar.hide()
         self.status_bar.addPermanentWidget(self.progress_bar)
 
-        self.status_bar.showMessage("Ready. Open a trip log file to begin.")
+        # Cancel button for long operations (hidden by default)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setMaximumWidth(70)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #b71c1c;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self._cancel_operation)
+        self.cancel_btn.hide()
+        self.status_bar.addPermanentWidget(self.cancel_btn)
+
+        self.status_bar.showMessage("Welcome! Click 'Open Trip Log' or press Ctrl+O to load a Volvo trip log file.")
 
     def _create_toolbar(self):
         """Create the toolbar with main actions"""
         toolbar = QFrame()
         toolbar.setFrameStyle(QFrame.Shape.StyledPanel)
-        toolbar.setFixedHeight(45)
+        toolbar.setFixedHeight(50)
+        toolbar.setStyleSheet("""
+            QFrame {
+                background: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+            }
+            QLabel {
+                color: #555;
+                font-weight: 500;
+            }
+        """)
         layout = QHBoxLayout(toolbar)
-        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(10)
 
         # Open file button
         open_btn = QPushButton("Open Trip Log")
+        open_btn.setToolTip(
+            "Open a Volvo trip log file for analysis.\n\n"
+            "Supported formats:\n"
+            "• CSV - Comma-separated values exported from Volvo On Call\n"
+            "• XLSX - Excel spreadsheet format\n\n"
+            "Shortcut: Ctrl+O"
+        )
+        open_btn.setShortcut("Ctrl+O")
         open_btn.clicked.connect(self._open_file)
         layout.addWidget(open_btn)
+
+        # Separator
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        sep1.setStyleSheet("background: #e0e0e0;")
+        layout.addWidget(sep1)
 
         # Date range
         layout.addWidget(QLabel("From:"))
         self.start_date = QDateEdit()
         self.start_date.setCalendarPopup(True)
-        self.start_date.setDate(QDate.currentDate().addMonths(-3))
+        self.start_date.setDate(QDate.currentDate().addDays(-30))
+        self.start_date.setToolTip(
+            "Start date for filtering trips.\n\n"
+            "Only trips on or after this date will be included.\n"
+            "Click the calendar icon to select a date."
+        )
         layout.addWidget(self.start_date)
 
         layout.addWidget(QLabel("To:"))
         self.end_date = QDateEdit()
         self.end_date.setCalendarPopup(True)
         self.end_date.setDate(QDate.currentDate())
+        self.end_date.setToolTip(
+            "End date for filtering trips.\n\n"
+            "Only trips on or before this date will be included.\n"
+            "Click the calendar icon to select a date."
+        )
         layout.addWidget(self.end_date)
+
+        # Date presets dropdown
+        self.date_presets = QComboBox()
+        self.date_presets.addItems([
+            "Custom",
+            "Last 30 Days",
+            "This Month",
+            "Last Month",
+            "This Quarter",
+            "Last Quarter",
+            "Year to Date",
+            "Last Year",
+            "All Data"
+        ])
+        self.date_presets.setToolTip(
+            "Quick date range presets.\n\n"
+            "Select a preset to automatically set the date range.\n"
+            "Choose 'Custom' to manually set dates."
+        )
+        self.date_presets.setMinimumWidth(110)
+        self.date_presets.currentTextChanged.connect(self._on_date_preset_changed)
+        layout.addWidget(self.date_presets)
 
         # Connect date changes to re-run analysis (if a file is loaded)
         self.start_date.dateChanged.connect(self._on_date_range_changed)
         self.end_date.dateChanged.connect(self._on_date_range_changed)
 
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("background: #e0e0e0;")
+        layout.addWidget(sep2)
+
         # Business lookup checkbox - default to enabled for automatic lookup
-        self.lookup_checkbox = QCheckBox("Enable Business Lookup")
+        self.lookup_checkbox = QCheckBox("Business Lookup")
         self.lookup_checkbox.setChecked(True)  # Enable by default
-        self.lookup_checkbox.setToolTip("Use online services to identify businesses (uses cache for speed)")
+        self.lookup_checkbox.setToolTip(
+            "Enable automatic business name lookup.\n\n"
+            "When enabled, uses Google Places API to identify businesses\n"
+            "at each destination address. This helps categorize trips\n"
+            "as Business vs Personal automatically.\n\n"
+            "Results are cached locally for faster subsequent loads.\n"
+            "Requires a Google API key configured in mileage_config.json."
+        )
         layout.addWidget(self.lookup_checkbox)
 
         # Analyze button
         analyze_btn = QPushButton("Analyze")
+        analyze_btn.setToolTip(
+            "Run or re-run the mileage analysis.\n\n"
+            "Processes the loaded trip data to:\n"
+            "• Merge false stops (traffic lights, brief stops)\n"
+            "• Flag micro-trips (GPS drift)\n"
+            "• Categorize trips as Business/Personal/Commute\n"
+            "• Calculate totals and statistics\n\n"
+            "Shortcut: Ctrl+R"
+        )
+        analyze_btn.setShortcut("Ctrl+R")
         analyze_btn.clicked.connect(self._run_analysis)
         layout.addWidget(analyze_btn)
 
@@ -3980,6 +5976,17 @@ class MileageAnalyzerGUI(QMainWindow):
 
         # Export button
         export_btn = QPushButton("Export to Excel")
+        export_btn.setObjectName("exportBtn")  # For custom styling
+        export_btn.setToolTip(
+            "Export analysis results to an Excel spreadsheet.\n\n"
+            "Creates a multi-sheet workbook containing:\n"
+            "• Summary - Overall mileage totals and statistics\n"
+            "• By Category - Breakdown by Business/Personal/Commute\n"
+            "• Detailed Trips - Every trip with full details\n"
+            "• Weekly Summary - Week-by-week breakdown\n\n"
+            "Shortcut: Ctrl+E"
+        )
+        export_btn.setShortcut("Ctrl+E")
         export_btn.clicked.connect(self._export_excel)
         layout.addWidget(export_btn)
 
@@ -4011,6 +6018,21 @@ class MileageAnalyzerGUI(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
+        # Edit menu
+        edit_menu = menubar.addMenu("&Edit")
+
+        self.undo_action = QAction("&Undo Mapping Change", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.triggered.connect(self._undo_mapping)
+        self.undo_action.setEnabled(False)
+        edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("&Redo Mapping Change", self)
+        self.redo_action.setShortcut("Ctrl+Y")
+        self.redo_action.triggered.connect(self._redo_mapping)
+        self.redo_action.setEnabled(False)
+        edit_menu.addAction(self.redo_action)
+
         # View menu
         view_menu = menubar.addMenu("&View")
 
@@ -4019,22 +6041,34 @@ class MileageAnalyzerGUI(QMainWindow):
         refresh_action.triggered.connect(self._run_analysis)
         view_menu.addAction(refresh_action)
 
+        view_menu.addSeparator()
+
+        self.dark_mode_action = QAction("&Dark Mode", self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setShortcut("Ctrl+D")
+        self.dark_mode_action.triggered.connect(self._toggle_dark_mode)
+        view_menu.addAction(self.dark_mode_action)
+
         # Tools menu
         tools_menu = menubar.addMenu("&Tools")
+
+        settings_action = QAction("&Settings...", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(self._show_settings)
+        tools_menu.addAction(settings_action)
+
+        tools_menu.addSeparator()
 
         mapping_action = QAction("Edit Business &Mappings...", self)
         mapping_action.triggered.connect(self._edit_mappings)
         tools_menu.addAction(mapping_action)
 
-        cache_action = QAction("Edit Address &Cache...", self)
-        cache_action.triggered.connect(self._edit_address_cache)
-        tools_menu.addAction(cache_action)
-
         tools_menu.addSeparator()
 
-        clear_cache_action = QAction("Clear Address Cache", self)
-        clear_cache_action.triggered.connect(self._clear_address_cache)
-        tools_menu.addAction(clear_cache_action)
+        clear_api_action = QAction("Clear &API Lookups...", self)
+        clear_api_action.setToolTip("Remove API lookup entries to allow re-lookup")
+        clear_api_action.triggered.connect(self._clear_api_lookups)
+        tools_menu.addAction(clear_api_action)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -4054,14 +6088,96 @@ class MileageAnalyzerGUI(QMainWindow):
 
         if file_path:
             self.current_file = file_path
+            self._dates_initialized = False  # Reset so dates get set from new file
             self.status_bar.showMessage(f"Loading: {os.path.basename(file_path)}...")
             # First load trips quickly without lookup, then auto-start lookup
             self._run_analysis(enable_lookup=False, auto_continue=True)
 
     def _on_date_range_changed(self):
         """Re-run analysis when date range is changed (if a file is loaded)"""
+        # When dates are manually changed, set preset to "Custom"
+        if hasattr(self, 'date_presets') and not getattr(self, '_updating_dates', False):
+            self.date_presets.blockSignals(True)
+            self.date_presets.setCurrentText("Custom")
+            self.date_presets.blockSignals(False)
+
         if self.current_file:
             # Re-filter with current lookup setting, no auto-continue
+            self._run_analysis()
+
+    def _on_date_preset_changed(self, preset: str):
+        """Handle date preset selection"""
+        if preset == "Custom":
+            return  # User wants manual control
+
+        today = QDate.currentDate()
+        start_date = today
+        end_date = today
+
+        if preset == "Last 30 Days":
+            start_date = today.addDays(-30)
+            end_date = today
+
+        elif preset == "This Month":
+            start_date = QDate(today.year(), today.month(), 1)
+            end_date = today
+
+        elif preset == "Last Month":
+            first_of_this_month = QDate(today.year(), today.month(), 1)
+            end_date = first_of_this_month.addDays(-1)
+            start_date = QDate(end_date.year(), end_date.month(), 1)
+
+        elif preset == "This Quarter":
+            quarter = (today.month() - 1) // 3
+            start_month = quarter * 3 + 1
+            start_date = QDate(today.year(), start_month, 1)
+            end_date = today
+
+        elif preset == "Last Quarter":
+            quarter = (today.month() - 1) // 3
+            if quarter == 0:
+                # Q4 of last year
+                start_date = QDate(today.year() - 1, 10, 1)
+                end_date = QDate(today.year() - 1, 12, 31)
+            else:
+                start_month = (quarter - 1) * 3 + 1
+                end_month = quarter * 3
+                start_date = QDate(today.year(), start_month, 1)
+                # Last day of the quarter
+                if end_month == 3:
+                    end_date = QDate(today.year(), 3, 31)
+                elif end_month == 6:
+                    end_date = QDate(today.year(), 6, 30)
+                elif end_month == 9:
+                    end_date = QDate(today.year(), 9, 30)
+
+        elif preset == "Year to Date":
+            start_date = QDate(today.year(), 1, 1)
+            end_date = today
+
+        elif preset == "Last Year":
+            start_date = QDate(today.year() - 1, 1, 1)
+            end_date = QDate(today.year() - 1, 12, 31)
+
+        elif preset == "All Data":
+            # Set to a very wide range; the analysis will clip to actual data
+            start_date = QDate(2000, 1, 1)
+            end_date = today
+
+        # Update date pickers without triggering analysis twice
+        self._updating_dates = True
+        self.start_date.blockSignals(True)
+        self.end_date.blockSignals(True)
+
+        self.start_date.setDate(start_date)
+        self.end_date.setDate(end_date)
+
+        self.start_date.blockSignals(False)
+        self.end_date.blockSignals(False)
+        self._updating_dates = False
+
+        # Now trigger the analysis once
+        if self.current_file:
             self._run_analysis()
 
     def _run_analysis(self, enable_lookup=None, auto_continue=False):
@@ -4075,6 +6191,20 @@ class MileageAnalyzerGUI(QMainWindow):
             QMessageBox.warning(self, "No File", "Please open a trip log file first.")
             return
 
+        # Stop any existing worker before starting a new one
+        if hasattr(self, 'worker') and self.worker is not None:
+            if self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait(3000)  # Wait up to 3 seconds
+            # Disconnect old signals to prevent duplicate connections
+            try:
+                self.worker.finished.disconnect()
+                self.worker.progress.disconnect()
+                self.worker.error.disconnect()
+            except (TypeError, RuntimeError):
+                pass  # Signals already disconnected or worker deleted
+            self.worker = None
+
         # Store whether to auto-continue with lookup after this pass
         self._auto_continue_lookup = auto_continue
 
@@ -4086,9 +6216,10 @@ class MileageAnalyzerGUI(QMainWindow):
         if enable_lookup is None:
             enable_lookup = self.lookup_checkbox.isChecked()
 
-        # Show progress
+        # Show progress and cancel button
         self.progress_bar.setRange(0, 0)  # Indeterminate
         self.progress_bar.show()
+        self.cancel_btn.show()
 
         # Run analysis in background thread
         self.worker = AnalysisWorker(
@@ -4109,6 +6240,31 @@ class MileageAnalyzerGUI(QMainWindow):
     def _on_analysis_complete(self, data: dict):
         """Handle analysis completion"""
         self.analysis_data = data
+
+        # Set date range from file data on first load
+        # Default to last 30 days from max date in file (or full range if shorter)
+        date_range = data.get('date_range', {})
+        if date_range.get('min') and not getattr(self, '_dates_initialized', False):
+            self._dates_initialized = True
+            # Block signals to prevent re-running analysis
+            self.start_date.blockSignals(True)
+            self.end_date.blockSignals(True)
+
+            min_date = QDate.fromString(date_range['min'], 'yyyy-MM-dd')
+            max_date = QDate.fromString(date_range['max'], 'yyyy-MM-dd')
+
+            # Set end date to max date in file
+            self.end_date.setDate(max_date)
+
+            # Set start date to 30 days before max date, or min date if range is shorter
+            start_30_days = max_date.addDays(-30)
+            if start_30_days < min_date:
+                self.start_date.setDate(min_date)
+            else:
+                self.start_date.setDate(start_30_days)
+
+            self.start_date.blockSignals(False)
+            self.end_date.blockSignals(False)
 
         # Update unified trip view
         trips = data.get('trips', [])
@@ -4134,30 +6290,117 @@ class MileageAnalyzerGUI(QMainWindow):
             self._run_analysis(enable_lookup=True, auto_continue=False)
         else:
             self.progress_bar.hide()
+            self.cancel_btn.hide()
             dest_count = len(self.unified_view.grouped_data)
             self.status_bar.showMessage(f"Analysis complete. {len(trips)} trips to {dest_count} destinations. {needs_name_count} need names.")
 
     def _on_analysis_error(self, error: str):
         """Handle analysis error"""
         self.progress_bar.hide()
+        self.cancel_btn.hide()
         QMessageBox.critical(self, "Analysis Error", f"Error during analysis:\n{error}")
         self.status_bar.showMessage("Analysis failed.")
 
+    def _cancel_operation(self):
+        """Cancel the current background operation"""
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(3000)  # Wait up to 3 seconds
+            self.worker = None
+        self.progress_bar.hide()
+        self.cancel_btn.hide()
+        self.status_bar.showMessage("Operation cancelled.")
+
     def _update_weekly_text(self, data: dict):
-        """Update the weekly breakdown text view"""
+        """Update the weekly breakdown with HTML formatting"""
         weekly_stats = data.get('weekly_stats', {})
 
-        text = "WEEKLY MILEAGE BREAKDOWN\n"
-        text += "=" * 80 + "\n\n"
-        text += f"{'Week Starting':<15} {'Commute':>10} {'Business':>10} {'Personal':>10} {'Total':>10}\n"
-        text += "-" * 55 + "\n"
+        html = """
+        <html>
+        <head>
+        <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; padding: 20px; background: #fafafa; }
+            h2 { color: #333; margin-bottom: 20px; }
+            table { border-collapse: collapse; width: 100%; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            th { background: #424242; color: white; padding: 12px 15px; text-align: right; font-weight: 600; }
+            th:first-child { text-align: left; }
+            td { padding: 10px 15px; border-bottom: 1px solid #eee; text-align: right; }
+            td:first-child { text-align: left; font-weight: 500; }
+            tr:hover { background: #f5f5f5; }
+            tr:last-child td { border-bottom: none; }
+            .commute { color: #1565c0; }
+            .business { color: #2e7d32; }
+            .personal { color: #e65100; }
+            .total { font-weight: bold; color: #333; }
+            .trips { color: #666; font-size: 0.9em; }
+            tfoot td { background: #f5f5f5; font-weight: bold; border-top: 2px solid #424242; }
+        </style>
+        </head>
+        <body>
+        <h2>Weekly Mileage Breakdown</h2>
+        <table>
+        <thead>
+            <tr>
+                <th>Week Starting</th>
+                <th>Trips</th>
+                <th>Commute</th>
+                <th>Business</th>
+                <th>Personal</th>
+                <th>Total</th>
+            </tr>
+        </thead>
+        <tbody>
+        """
+
+        total_trips = 0
+        total_commute = 0
+        total_business = 0
+        total_personal = 0
+        total_all = 0
 
         for week in sorted(weekly_stats.keys()):
             stats = weekly_stats[week]
-            text += f"{week:<15} {stats.get('commute', 0):>10.1f} {stats.get('business', 0):>10.1f} "
-            text += f"{stats.get('personal', 0):>10.1f} {stats.get('total', 0):>10.1f}\n"
+            trips = len(stats.get('trips', []))
+            commute = stats.get('commute', 0)
+            business = stats.get('business', 0)
+            personal = stats.get('personal', 0)
+            total = stats.get('total', 0)
 
-        self.weekly_text.setText(text)
+            total_trips += trips
+            total_commute += commute
+            total_business += business
+            total_personal += personal
+            total_all += total
+
+            html += f"""
+            <tr>
+                <td>{week}</td>
+                <td class="trips">{trips}</td>
+                <td class="commute">{commute:.1f}</td>
+                <td class="business">{business:.1f}</td>
+                <td class="personal">{personal:.1f}</td>
+                <td class="total">{total:.1f}</td>
+            </tr>
+            """
+
+        html += f"""
+        </tbody>
+        <tfoot>
+            <tr>
+                <td>TOTALS</td>
+                <td class="trips">{total_trips}</td>
+                <td class="commute">{total_commute:.1f}</td>
+                <td class="business">{total_business:.1f}</td>
+                <td class="personal">{total_personal:.1f}</td>
+                <td class="total">{total_all:.1f}</td>
+            </tr>
+        </tfoot>
+        </table>
+        </body>
+        </html>
+        """
+
+        self.weekly_text.setHtml(html)
 
     def _on_category_filter_changed(self, category: str):
         """Handle category filter change"""
@@ -4210,9 +6453,76 @@ class MileageAnalyzerGUI(QMainWindow):
         self.unified_view._refresh_table()
         self.status_bar.showMessage(f"Set business name to: {business_name}", 5000)
 
-    def _save_business_mapping(self, address: str, business_name: str):
+    def _backup_file(self, file_path: str):
+        """Create a backup of a file before modifying it"""
+        if not os.path.exists(file_path):
+            return
+
+        try:
+            # Create backup with .bak extension
+            backup_path = file_path + '.bak'
+            import shutil
+            shutil.copy2(file_path, backup_path)
+        except Exception as e:
+            # Backup failure shouldn't prevent saving
+            print(f"Warning: Could not create backup: {e}")
+
+    def _save_business_mapping(self, address: str, business_name: str, category: str = None, track_undo: bool = True):
         """Save address to business name mapping"""
         mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+
+        # Load existing mapping
+        mappings = {}
+        if os.path.exists(mapping_file):
+            try:
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    mappings = json.load(f)
+            except json.JSONDecodeError as e:
+                self.status_bar.showMessage(f"Warning: Corrupt mapping file, starting fresh", 5000)
+            except Exception as e:
+                self.status_bar.showMessage(f"Warning: Could not load mappings: {e}", 5000)
+
+        # Track previous value for undo (before making changes)
+        if track_undo:
+            old_value = mappings.get(address)  # None if didn't exist
+            self._undo_stack.append((address, old_value))
+            self._redo_stack.clear()  # Clear redo when new action is performed
+            self._update_undo_actions()
+
+        # Build entry with source=manual
+        entry = {"name": business_name, "source": "manual"}
+        if category:
+            entry["category"] = category
+
+        mappings[address] = entry
+
+        try:
+            # Create backup before saving
+            self._backup_file(mapping_file)
+
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(mappings, f, indent=2, ensure_ascii=False)
+            self.status_bar.showMessage(f"Saved mapping: {business_name}", 3000)
+        except PermissionError:
+            QMessageBox.warning(self, "Save Error",
+                f"Cannot save mapping - file is in use.\n\nClose any other programs using:\n{mapping_file}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Failed to save mapping:\n{e}")
+
+    def _update_undo_actions(self):
+        """Update the enabled state of undo/redo menu actions"""
+        self.undo_action.setEnabled(len(self._undo_stack) > 0)
+        self.redo_action.setEnabled(len(self._redo_stack) > 0)
+
+    def _undo_mapping(self):
+        """Undo the last mapping change"""
+        if not self._undo_stack:
+            return
+
+        address, old_value = self._undo_stack.pop()
+        mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+
+        # Load current mappings
         mappings = {}
         if os.path.exists(mapping_file):
             try:
@@ -4220,12 +6530,78 @@ class MileageAnalyzerGUI(QMainWindow):
                     mappings = json.load(f)
             except:
                 pass
-        mappings[address] = business_name
+
+        # Save current value to redo stack
+        current_value = mappings.get(address)
+        self._redo_stack.append((address, current_value))
+
+        # Restore old value
+        if old_value is None:
+            # Remove the mapping (it didn't exist before)
+            if address in mappings:
+                del mappings[address]
+            self.status_bar.showMessage(f"Undone: Removed mapping for address", 3000)
+        else:
+            mappings[address] = old_value
+            name = old_value.get('name', '') if isinstance(old_value, dict) else old_value
+            self.status_bar.showMessage(f"Undone: Restored mapping to '{name}'", 3000)
+
+        # Save mappings
         try:
             with open(mapping_file, 'w', encoding='utf-8') as f:
                 json.dump(mappings, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            self.status_bar.showMessage(f"Failed to save mapping: {e}", 5000)
+            QMessageBox.warning(self, "Undo Error", f"Failed to undo:\n{e}")
+
+        self._update_undo_actions()
+
+        # Refresh the analysis to show updated categorization
+        if self.current_file:
+            self._run_analysis()
+
+    def _redo_mapping(self):
+        """Redo the last undone mapping change"""
+        if not self._redo_stack:
+            return
+
+        address, old_value = self._redo_stack.pop()
+        mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+
+        # Load current mappings
+        mappings = {}
+        if os.path.exists(mapping_file):
+            try:
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    mappings = json.load(f)
+            except:
+                pass
+
+        # Save current value to undo stack
+        current_value = mappings.get(address)
+        self._undo_stack.append((address, current_value))
+
+        # Restore the redo value
+        if old_value is None:
+            if address in mappings:
+                del mappings[address]
+            self.status_bar.showMessage(f"Redone: Removed mapping", 3000)
+        else:
+            mappings[address] = old_value
+            name = old_value.get('name', '') if isinstance(old_value, dict) else old_value
+            self.status_bar.showMessage(f"Redone: Restored mapping to '{name}'", 3000)
+
+        # Save mappings
+        try:
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(mappings, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Redo Error", f"Failed to redo:\n{e}")
+
+        self._update_undo_actions()
+
+        # Refresh the analysis to show updated categorization
+        if self.current_file:
+            self._run_analysis()
 
     def _on_show_daily_journey(self, trips: list):
         """Handle show daily journey request"""
@@ -4266,6 +6642,12 @@ class MileageAnalyzerGUI(QMainWindow):
                 elif category == 'COMMUTE':
                     totals['commute_miles'] += distance
 
+            # Calculate percentages
+            total_all = totals['total_miles']
+            totals['business_pct'] = (totals['business_miles'] / total_all * 100) if total_all > 0 else 0
+            totals['personal_pct'] = (totals['personal_miles'] / total_all * 100) if total_all > 0 else 0
+            totals['commute_pct'] = (totals['commute_miles'] / total_all * 100) if total_all > 0 else 0
+
             self.analysis_data['totals'] = totals
             self.summary_widget.update_stats(self.analysis_data)
 
@@ -4288,6 +6670,12 @@ class MileageAnalyzerGUI(QMainWindow):
                 trips = self.analysis_data.get('trips', [])
                 weekly_stats = self.analysis_data.get('weekly_stats', {})
                 totals = self.analysis_data.get('totals', {})
+
+                # Merge notes into trips data for export
+                notes = load_trip_notes()
+                for trip in trips:
+                    trip_key = get_trip_key(trip)
+                    trip['notes'] = notes.get(trip_key, '')
 
                 # export_to_excel expects individual totals, not a dict
                 analyzer.export_to_excel(
@@ -4319,6 +6707,22 @@ class MileageAnalyzerGUI(QMainWindow):
             "MileageAnalyzer.exe --analyze-unresolved"
         )
 
+    def _show_settings(self):
+        """Open settings dialog"""
+        dialog = SettingsDialog(self)
+        dialog.settings_changed.connect(self._on_settings_changed)
+        dialog.exec()
+
+    def _on_settings_changed(self):
+        """Handle settings changes"""
+        # Reload config in analyze_mileage module if it's been imported
+        try:
+            from analyze_mileage import load_config
+            load_config()
+        except:
+            pass
+        self.status_bar.showMessage("Settings updated. Re-run analysis to apply changes.")
+
     def _edit_mappings(self):
         """Open business mappings editor"""
         mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
@@ -4335,45 +6739,399 @@ class MileageAnalyzerGUI(QMainWindow):
         self.mapping_editor.data_saved.connect(self._on_mapping_saved)
         self.mapping_editor.show()
 
-    def _edit_address_cache(self):
-        """Open address cache editor"""
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if not os.path.exists(cache_file):
-            QMessageBox.information(
-                self, "No Cache",
-                "Address cache is empty.\n"
-                "Run an analysis with business lookup to populate the cache."
-            )
+    def _clear_api_lookups(self):
+        """Clear API lookup entries from business mapping, keeping manual entries"""
+        mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+        if not os.path.exists(mapping_file):
+            QMessageBox.information(self, "No Mappings", "Business mapping file is empty.")
             return
 
-        self.cache_editor = JsonEditorDialog(
-            cache_file,
-            "Address Cache Editor",
-            self
-        )
-        self.cache_editor.show()
+        # Load current mapping
+        try:
+            with open(mapping_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except:
+            QMessageBox.critical(self, "Error", "Failed to load business mapping file.")
+            return
 
-    def _clear_address_cache(self):
-        """Clear the address cache"""
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if not os.path.exists(cache_file):
-            QMessageBox.information(self, "No Cache", "Address cache is already empty.")
+        # Count API entries
+        api_count = 0
+        manual_count = 0
+        for addr, value in data.items():
+            if isinstance(value, dict):
+                source = value.get('source', 'manual')
+                if source in ['google_api', 'osm_api']:
+                    api_count += 1
+                else:
+                    manual_count += 1
+            else:
+                manual_count += 1
+
+        if api_count == 0:
+            QMessageBox.information(self, "No API Entries",
+                "No API lookup entries found.\n"
+                f"All {manual_count} entries are manual.")
             return
 
         reply = QMessageBox.question(
-            self, "Confirm Clear Cache",
-            "This will delete all cached address lookups.\n"
-            "The next analysis will need to re-lookup all business names.\n\n"
+            self, "Confirm Clear API Lookups",
+            f"This will remove {api_count} API lookup entries.\n"
+            f"{manual_count} manual entries will be preserved.\n\n"
+            "The next analysis will re-lookup the cleared addresses.\n\n"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            # Keep only manual entries
+            new_data = {}
+            for addr, value in data.items():
+                if isinstance(value, dict):
+                    source = value.get('source', 'manual')
+                    if source not in ['google_api', 'osm_api']:
+                        new_data[addr] = value
+                else:
+                    new_data[addr] = value
+
             try:
-                os.remove(cache_file)
-                QMessageBox.information(self, "Cache Cleared", "Address cache has been cleared.")
+                with open(mapping_file, 'w', encoding='utf-8') as f:
+                    json.dump(new_data, f, indent=2, ensure_ascii=False)
+                QMessageBox.information(self, "API Lookups Cleared",
+                    f"Removed {api_count} API lookup entries.\n"
+                    f"Kept {len(new_data)} manual entries."
+                )
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to clear cache:\n{e}")
+                QMessageBox.critical(self, "Error", f"Failed to save:\n{e}")
+
+    def _toggle_dark_mode(self, enabled: bool):
+        """Toggle dark mode on/off"""
+        if enabled:
+            self._apply_dark_style()
+        else:
+            self._apply_light_style()
+        # Save preference
+        settings = self._get_settings()
+        settings.setValue("darkMode", enabled)
+
+    def _apply_dark_style(self):
+        """Apply dark mode stylesheet"""
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
+            QWidget {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background-color: #0d47a1;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:pressed {
+                background-color: #1976d2;
+            }
+            QPushButton:disabled {
+                background-color: #424242;
+                color: #757575;
+            }
+            QPushButton#exportBtn {
+                background-color: #2e7d32;
+            }
+            QPushButton#exportBtn:hover {
+                background-color: #388e3c;
+            }
+            QDateEdit, QComboBox, QLineEdit {
+                padding: 5px 8px;
+                border: 1px solid #424242;
+                border-radius: 4px;
+                background: #2d2d2d;
+                color: #e0e0e0;
+            }
+            QDateEdit:focus, QComboBox:focus, QLineEdit:focus {
+                border-color: #1976d2;
+            }
+            QComboBox QAbstractItemView {
+                background: #2d2d2d;
+                border: 1px solid #424242;
+                selection-background-color: #0d47a1;
+                selection-color: white;
+            }
+            QTabWidget::pane {
+                border: 1px solid #424242;
+                border-radius: 4px;
+                background: #252525;
+            }
+            QTabBar::tab {
+                background: #2d2d2d;
+                color: #b0b0b0;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #252525;
+                color: white;
+                border-bottom: 2px solid #1976d2;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #353535;
+            }
+            QTableWidget, QTreeWidget {
+                background-color: #252525;
+                alternate-background-color: #2d2d2d;
+                color: #e0e0e0;
+                gridline-color: #3d3d3d;
+                border: 1px solid #424242;
+            }
+            QTableWidget::item:selected, QTreeWidget::item:selected {
+                background-color: #0d47a1;
+                color: white;
+            }
+            QHeaderView::section {
+                background-color: #2d2d2d;
+                color: #e0e0e0;
+                padding: 6px;
+                border: none;
+                border-bottom: 1px solid #424242;
+            }
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background: #3d3d3d;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #1976d2;
+                border-radius: 4px;
+            }
+            QStatusBar {
+                background: #252525;
+                border-top: 1px solid #424242;
+                color: #b0b0b0;
+            }
+            QMenuBar {
+                background: #2d2d2d;
+                color: #e0e0e0;
+            }
+            QMenuBar::item:selected {
+                background: #424242;
+            }
+            QMenu {
+                background: #2d2d2d;
+                color: #e0e0e0;
+                border: 1px solid #424242;
+            }
+            QMenu::item:selected {
+                background: #0d47a1;
+            }
+            QScrollBar:vertical {
+                background: #2d2d2d;
+                width: 12px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: #5d5d5d;
+                min-height: 20px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #6d6d6d;
+            }
+            QScrollBar:horizontal {
+                background: #2d2d2d;
+                height: 12px;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background: #5d5d5d;
+                min-width: 20px;
+                border-radius: 6px;
+            }
+            QFrame {
+                background: #252525;
+                border-color: #424242;
+            }
+            QTextEdit {
+                background: #252525;
+                color: #e0e0e0;
+                border: 1px solid #424242;
+            }
+            QLabel {
+                color: #e0e0e0;
+                background: transparent;
+            }
+            QCheckBox {
+                color: #e0e0e0;
+            }
+            QToolTip {
+                background-color: #2d2d2d;
+                color: #e0e0e0;
+                border: 1px solid #424242;
+            }
+            QSplitter::handle {
+                background: #424242;
+            }
+            QSplitter::handle:hover {
+                background: #1976d2;
+            }
+        """)
+
+    def _apply_light_style(self):
+        """Apply light mode stylesheet (restore default)"""
+        # Restore the original light theme from _setup_ui
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QPushButton {
+                background-color: #1976d2;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #1565c0;
+            }
+            QPushButton:pressed {
+                background-color: #0d47a1;
+            }
+            QPushButton:disabled {
+                background-color: #bdbdbd;
+                color: #757575;
+            }
+            QPushButton#exportBtn {
+                background-color: #388e3c;
+            }
+            QPushButton#exportBtn:hover {
+                background-color: #2e7d32;
+            }
+            QDateEdit {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+            }
+            QDateEdit:focus {
+                border-color: #1976d2;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background: white;
+            }
+            QTabBar::tab {
+                background: #e0e0e0;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: white;
+                border-bottom: 2px solid #1976d2;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #eeeeee;
+            }
+            QProgressBar {
+                border: none;
+                border-radius: 4px;
+                background: #e0e0e0;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #1976d2;
+                border-radius: 4px;
+            }
+            QStatusBar {
+                background: #fafafa;
+                border-top: 1px solid #e0e0e0;
+            }
+            QComboBox {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+                min-width: 120px;
+            }
+            QComboBox:focus {
+                border-color: #1976d2;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background: white;
+                border: 1px solid #ccc;
+                selection-background-color: #e3f2fd;
+                selection-color: #1976d2;
+                padding: 4px;
+            }
+            QLineEdit {
+                padding: 5px 8px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: white;
+            }
+            QLineEdit:focus {
+                border-color: #1976d2;
+            }
+            QSplitter::handle {
+                background: #e0e0e0;
+            }
+            QSplitter::handle:horizontal {
+                width: 3px;
+            }
+            QSplitter::handle:hover {
+                background: #1976d2;
+            }
+            QToolTip {
+                background-color: #424242;
+                color: white;
+                border: none;
+                padding: 5px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QTableWidget {
+                background-color: white;
+                alternate-background-color: #fafafa;
+                border: 1px solid #e0e0e0;
+                gridline-color: #f0f0f0;
+            }
+            QTableWidget::item:selected {
+                background-color: #e3f2fd;
+                color: #1976d2;
+            }
+            QHeaderView::section {
+                background-color: #f5f5f5;
+                padding: 6px;
+                border: none;
+                border-bottom: 1px solid #e0e0e0;
+                font-weight: 600;
+                color: #424242;
+            }
+        """)
 
     def _show_about(self):
         """Show about dialog"""
@@ -4393,6 +7151,57 @@ class MileageAnalyzerGUI(QMainWindow):
             "<li>Excel report generation</li>"
             "</ul>"
         )
+
+    def _get_settings(self) -> QSettings:
+        """Get QSettings object for storing application settings"""
+        return QSettings("DewartRepresentatives", "MileageAnalyzer")
+
+    def _save_window_state(self):
+        """Save window geometry and splitter state"""
+        settings = self._get_settings()
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        if hasattr(self, 'main_splitter'):
+            settings.setValue("splitterState", self.main_splitter.saveState())
+        if hasattr(self, 'right_tabs'):
+            settings.setValue("rightTabIndex", self.right_tabs.currentIndex())
+
+    def _restore_window_state(self):
+        """Restore window geometry and splitter state"""
+        settings = self._get_settings()
+
+        # Restore window geometry
+        geometry = settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+
+        # Restore window state
+        state = settings.value("windowState")
+        if state:
+            self.restoreState(state)
+
+        # Restore splitter state
+        if hasattr(self, 'main_splitter'):
+            splitter_state = settings.value("splitterState")
+            if splitter_state:
+                self.main_splitter.restoreState(splitter_state)
+
+        # Restore active tab on right side
+        if hasattr(self, 'right_tabs'):
+            tab_index = settings.value("rightTabIndex", type=int)
+            if tab_index is not None and 0 <= tab_index < self.right_tabs.count():
+                self.right_tabs.setCurrentIndex(tab_index)
+
+        # Restore dark mode setting
+        dark_mode = settings.value("darkMode", False, type=bool)
+        if dark_mode:
+            self.dark_mode_action.setChecked(True)
+            self._apply_dark_style()
+
+    def closeEvent(self, event):
+        """Handle window close - save state before closing"""
+        self._save_window_state()
+        super().closeEvent(event)
 
 
 def main():

@@ -161,35 +161,23 @@ def is_business_location(address):
             return True
     return False
 
-# Cache for address lookups
-ADDRESS_CACHE_FILE = "address_cache.json"
+# Business mapping file - unified storage for all address->business mappings
+# Format: {address: {name: str, category: str, source: str}}
+# source can be "manual" or "google_api"
 BUSINESS_MAPPING_FILE = "business_mapping.json"
 CONFIG_FILE = "config.json"
-address_lookup_cache = {}
 business_mapping = {}
 google_api_key = None
 gmaps_client = None
 
-def load_address_cache():
-    """Load cached address lookups from file"""
-    global address_lookup_cache
-    if os.path.exists(ADDRESS_CACHE_FILE):
-        try:
-            with open(ADDRESS_CACHE_FILE, 'r', encoding='utf-8') as f:
-                address_lookup_cache = json.load(f)
-        except:
-            address_lookup_cache = {}
-
-def save_address_cache():
-    """Save address lookups to cache file"""
-    try:
-        with open(ADDRESS_CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(address_lookup_cache, f, indent=2)
-    except:
-        pass
 
 def load_business_mapping():
-    """Load manual business name mappings"""
+    """Load business name mappings from file
+
+    Handles multiple formats for backward compatibility:
+    - Old format: {address: name}
+    - New format: {address: {name, category, source}}
+    """
     global business_mapping
     if os.path.exists(BUSINESS_MAPPING_FILE):
         try:
@@ -199,6 +187,50 @@ def load_business_mapping():
                 business_mapping = {k: v for k, v in data.items() if not k.startswith('_')}
         except:
             business_mapping = {}
+
+
+def save_business_mapping():
+    """Save business mappings to file"""
+    try:
+        with open(BUSINESS_MAPPING_FILE, 'w', encoding='utf-8') as f:
+            json.dump(business_mapping, f, indent=2, ensure_ascii=False)
+    except:
+        pass
+
+
+def get_mapping_name(address: str) -> str:
+    """Get the business name from mapping, handling both old and new format"""
+    value = business_mapping.get(address)
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get('name', '')
+    return value
+
+
+def get_mapping_category(address: str) -> str:
+    """Get the category from mapping if available (new format only)"""
+    value = business_mapping.get(address)
+    if isinstance(value, dict):
+        return value.get('category')
+    return None
+
+
+def get_mapping_source(address: str) -> str:
+    """Get the source of a mapping (manual or google_api)"""
+    value = business_mapping.get(address)
+    if isinstance(value, dict):
+        return value.get('source', 'manual')
+    return 'manual'
+
+
+def set_mapping_entry(address: str, name: str, category: str = None, source: str = "manual"):
+    """Set a business mapping entry"""
+    entry = {'name': name, 'source': source}
+    if category:
+        entry['category'] = category
+    business_mapping[address] = entry
+
 
 def load_config():
     """Load configuration including Google API key and addresses"""
@@ -323,32 +355,33 @@ def lookup_business_google_places(address):
     return None
 
 def lookup_business_at_address(address, use_cache=True):
-    """Look up what business is at a given address using multiple methods"""
+    """Look up what business is at a given address using multiple methods
+
+    All lookups are stored in business_mapping with source='google_api' or 'manual'
+    """
     if not address:
         return None
 
-    # Check manual mapping first (highest priority) - exact match
-    if address in business_mapping:
-        return business_mapping[address]
+    # Check mapping first (exact match) - includes both manual and API lookups
+    mapped_name = get_mapping_name(address)
+    if mapped_name is not None:
+        # If we stored that no business was found, return None without lookup
+        if mapped_name == "NO_BUSINESS_FOUND":
+            return None
+        return mapped_name
 
-    # Check manual mapping with fuzzy matching (partial address match)
+    # Check mapping with fuzzy matching (partial address match)
     # This allows mapping "10484 Beardslee Blvd, Bothell" to match "10484 Beardslee Blvd, Bothell WA 98011"
     normalized_address = normalize_address(address)
-    for mapped_addr, business_name in business_mapping.items():
+    for mapped_addr in business_mapping.keys():
         normalized_mapped = normalize_address(mapped_addr)
         # Check if the mapped address is contained in the actual address or vice versa
         if normalized_mapped in normalized_address or normalized_address in normalized_mapped:
-            print(f"    ✓ FUZZY MATCHED: {business_name} (mapping: {mapped_addr[:30]})")
-            sys.stdout.flush()
-            return business_name
-
-    # Check cache (exact match)
-    if use_cache and address in address_lookup_cache:
-        cached_value = address_lookup_cache[address]
-        # If we cached that no business was found, return None without lookup
-        if cached_value == "NO_BUSINESS_FOUND":
-            return None
-        return cached_value
+            business_name = get_mapping_name(mapped_addr)
+            if business_name and business_name != "NO_BUSINESS_FOUND":
+                print(f"    ✓ FUZZY MATCHED: {business_name} (mapping: {mapped_addr[:30]})")
+                sys.stdout.flush()
+                return business_name
 
     business_name = None
 
@@ -356,30 +389,32 @@ def lookup_business_at_address(address, use_cache=True):
     if gmaps_client:
         business_name = lookup_business_google_places(address)
         if business_name:
-            address_lookup_cache[address] = business_name
+            # Store in unified mapping with source
+            set_mapping_entry(address, business_name, source="google_api")
             return business_name
-        # If no business found, check for fuzzy matches before caching as NO_BUSINESS_FOUND
+        # If no business found, check for fuzzy matches before storing as NO_BUSINESS_FOUND
         else:
-            # Check for similar addresses in cache with business names
+            # Check for similar addresses in mapping with business names
             fuzzy_matches = []
-            for cached_addr, cached_value in address_lookup_cache.items():
+            for mapped_addr in business_mapping.keys():
+                mapped_name = get_mapping_name(mapped_addr)
                 # Skip NO_BUSINESS_FOUND entries
-                if cached_value == "NO_BUSINESS_FOUND":
+                if not mapped_name or mapped_name == "NO_BUSINESS_FOUND":
                     continue
 
-                normalized_cached = normalize_address(cached_addr)
-                # Check if the cached address is contained in the actual address or vice versa
-                if normalized_cached in normalized_address or normalized_address in normalized_cached:
+                normalized_mapped = normalize_address(mapped_addr)
+                # Check if the mapped address is contained in the actual address or vice versa
+                if normalized_mapped in normalized_address or normalized_address in normalized_mapped:
                     # Additional check: they should share significant parts
                     address_parts = set(normalized_address.split())
-                    cached_parts = set(normalized_cached.split())
-                    common_parts = address_parts & cached_parts
+                    mapped_parts = set(normalized_mapped.split())
+                    common_parts = address_parts & mapped_parts
 
                     # If they share at least 3 parts, it's a potential match
                     if len(common_parts) >= 3:
                         fuzzy_matches.append({
-                            'address': cached_addr,
-                            'business_name': cached_value,
+                            'address': mapped_addr,
+                            'business_name': mapped_name,
                             'common_parts': len(common_parts)
                         })
 
@@ -400,8 +435,8 @@ def lookup_business_at_address(address, use_cache=True):
                     if response == '' or response == 'y' or response == 'yes':
                         print(f"    ✓ Using: {best_match['business_name']}")
                         sys.stdout.flush()
-                        # Cache this address with the matched business name
-                        address_lookup_cache[address] = best_match['business_name']
+                        # Store this address with the matched business name
+                        set_mapping_entry(address, best_match['business_name'], source="google_api")
                         return best_match['business_name']
                     else:
                         print(f"    Skipping fuzzy match")
@@ -411,8 +446,8 @@ def lookup_business_at_address(address, use_cache=True):
                     print(f"    Skipping fuzzy match")
                     sys.stdout.flush()
 
-            # Cache the fact that no business was found
-            address_lookup_cache[address] = "NO_BUSINESS_FOUND"
+            # Store the fact that no business was found
+            set_mapping_entry(address, "NO_BUSINESS_FOUND", source="google_api")
             return None
 
     # Fall back to OpenStreetMap if Google didn't find anything
@@ -490,31 +525,32 @@ def lookup_business_at_address(address, use_cache=True):
                                     business_name = name
                                     break
 
-            # Cache the result if found
+            # Store the result if found
             if business_name and business_name not in ['', 'yes']:
-                address_lookup_cache[address] = business_name
+                set_mapping_entry(address, business_name, source="osm_api")
                 return business_name
             else:
-                # OpenStreetMap also failed - check for fuzzy matches before caching
+                # OpenStreetMap also failed - check for fuzzy matches before storing as not found
                 fuzzy_matches = []
-                for cached_addr, cached_value in address_lookup_cache.items():
+                for mapped_addr in business_mapping.keys():
+                    mapped_name = get_mapping_name(mapped_addr)
                     # Skip NO_BUSINESS_FOUND entries
-                    if cached_value == "NO_BUSINESS_FOUND":
+                    if not mapped_name or mapped_name == "NO_BUSINESS_FOUND":
                         continue
 
-                    normalized_cached = normalize_address(cached_addr)
-                    # Check if the cached address is contained in the actual address or vice versa
-                    if normalized_cached in normalized_address or normalized_address in normalized_cached:
+                    normalized_mapped = normalize_address(mapped_addr)
+                    # Check if the mapped address is contained in the actual address or vice versa
+                    if normalized_mapped in normalized_address or normalized_address in normalized_mapped:
                         # Additional check: they should share significant parts
                         address_parts = set(normalized_address.split())
-                        cached_parts = set(normalized_cached.split())
-                        common_parts = address_parts & cached_parts
+                        mapped_parts = set(normalized_mapped.split())
+                        common_parts = address_parts & mapped_parts
 
                         # If they share at least 3 parts, it's a potential match
                         if len(common_parts) >= 3:
                             fuzzy_matches.append({
-                                'address': cached_addr,
-                                'business_name': cached_value,
+                                'address': mapped_addr,
+                                'business_name': mapped_name,
                                 'common_parts': len(common_parts)
                             })
 
@@ -535,8 +571,8 @@ def lookup_business_at_address(address, use_cache=True):
                         if response == '' or response == 'y' or response == 'yes':
                             print(f"    ✓ Using: {best_match['business_name']}")
                             sys.stdout.flush()
-                            # Cache this address with the matched business name
-                            address_lookup_cache[address] = best_match['business_name']
+                            # Store this address with the matched business name
+                            set_mapping_entry(address, best_match['business_name'], source="osm_api")
                             return best_match['business_name']
                         else:
                             print(f"    Skipping fuzzy match")
@@ -546,28 +582,29 @@ def lookup_business_at_address(address, use_cache=True):
                         print(f"    Skipping fuzzy match")
                         sys.stdout.flush()
 
-                # Cache that no business was found (OpenStreetMap also failed)
-                address_lookup_cache[address] = "NO_BUSINESS_FOUND"
+                # Store that no business was found (OpenStreetMap also failed)
+                set_mapping_entry(address, "NO_BUSINESS_FOUND", source="osm_api")
                 return None
 
     except (GeocoderTimedOut, GeocoderServiceError) as e:
         # Don't print errors for every lookup - they're cached anyway
-        # Check for fuzzy matches before caching as failed
+        # Check for fuzzy matches before storing as failed
         fuzzy_matches = []
-        for cached_addr, cached_value in address_lookup_cache.items():
-            if cached_value == "NO_BUSINESS_FOUND":
+        for mapped_addr in business_mapping.keys():
+            mapped_name = get_mapping_name(mapped_addr)
+            if not mapped_name or mapped_name == "NO_BUSINESS_FOUND":
                 continue
 
-            normalized_cached = normalize_address(cached_addr)
-            if normalized_cached in normalized_address or normalized_address in normalized_cached:
+            normalized_mapped = normalize_address(mapped_addr)
+            if normalized_mapped in normalized_address or normalized_address in normalized_mapped:
                 address_parts = set(normalized_address.split())
-                cached_parts = set(normalized_cached.split())
-                common_parts = address_parts & cached_parts
+                mapped_parts = set(normalized_mapped.split())
+                common_parts = address_parts & mapped_parts
 
                 if len(common_parts) >= 3:
                     fuzzy_matches.append({
-                        'address': cached_addr,
-                        'business_name': cached_value,
+                        'address': mapped_addr,
+                        'business_name': mapped_name,
                         'common_parts': len(common_parts)
                     })
 
@@ -586,7 +623,7 @@ def lookup_business_at_address(address, use_cache=True):
                 if response == '' or response == 'y' or response == 'yes':
                     print(f"    ✓ Using: {best_match['business_name']}")
                     sys.stdout.flush()
-                    address_lookup_cache[address] = best_match['business_name']
+                    set_mapping_entry(address, best_match['business_name'], source="osm_api")
                     return best_match['business_name']
                 else:
                     print(f"    Skipping fuzzy match")
@@ -596,12 +633,12 @@ def lookup_business_at_address(address, use_cache=True):
                 print(f"    Skipping fuzzy match")
                 sys.stdout.flush()
 
-        address_lookup_cache[address] = "NO_BUSINESS_FOUND"
+        set_mapping_entry(address, "NO_BUSINESS_FOUND", source="osm_api")
         pass
     except Exception as e:
         # Silently fail for individual lookups
-        # Still cache the failed lookup
-        address_lookup_cache[address] = "NO_BUSINESS_FOUND"
+        # Still store the failed lookup
+        set_mapping_entry(address, "NO_BUSINESS_FOUND", source="osm_api")
         pass
 
     return None
@@ -635,6 +672,13 @@ def categorize_trip(trip, prev_trip=None, next_trip=None, enable_lookup=False):
     end_addr = trip['end_address']
     distance = trip['distance']
     timestamp = trip['started']
+
+    # Check if we have a saved category in the business mapping (highest priority)
+    saved_category = get_mapping_category(end_addr)
+    if saved_category:
+        # Use saved category with business name lookup
+        business_name = get_business_name(end_addr, lookup=enable_lookup)
+        return saved_category.lower(), business_name
 
     # Gas stations are always business
     if is_business_location(start_addr) or is_business_location(end_addr):
@@ -709,6 +753,182 @@ def parse_distance(dist_str):
         return float(cleaned) if cleaned else 0.0
     except:
         return 0.0
+
+def merge_short_stops(trips, max_gap_minutes=3, max_stop_distance=0.2):
+    """
+    Merge trips that are likely false stops (red lights, traffic, etc.)
+
+    Heuristics:
+    - Gap between trips is very short (< max_gap_minutes, default 3 min)
+    - The "stop" trip has a very short distance (< max_stop_distance, default 0.2 miles)
+    - The end address of first trip matches (or is very close to) start of next trip
+
+    When merged:
+    - Keep start time and start address from first trip
+    - Keep end time and end address from last trip
+    - Sum the distances
+    - Store merged trip info for transparency
+
+    Returns: (merged_trips, merge_count)
+    """
+    if not trips or len(trips) < 2:
+        return trips, 0
+
+    # Sort by start time to ensure proper ordering
+    sorted_trips = sorted(trips, key=lambda x: x['started'])
+
+    merged = []
+    merge_count = 0
+    i = 0
+
+    while i < len(sorted_trips):
+        current = sorted_trips[i].copy()  # Copy to avoid modifying original
+
+        # Look ahead to see if we should merge with next trip(s)
+        while i + 1 < len(sorted_trips):
+            next_trip = sorted_trips[i + 1]
+
+            # Parse stop time from current trip
+            current_stop = None
+            if 'stopped' in current and current['stopped']:
+                if isinstance(current['stopped'], datetime):
+                    current_stop = current['stopped']
+                else:
+                    try:
+                        current_stop = datetime.strptime(str(current['stopped']).strip(), '%Y-%m-%d %H:%M')
+                    except:
+                        pass
+
+            next_start = next_trip['started']
+
+            if current_stop is None:
+                # Can't determine gap without stop time
+                break
+
+            # Calculate gap between trips
+            gap = next_start - current_stop
+            gap_minutes = gap.total_seconds() / 60
+
+            # Check if this looks like a false stop
+            # Either the current trip is very short OR the next trip is very short
+            # AND the gap is small
+            current_distance = current.get('distance', 0)
+            next_distance = next_trip.get('distance', 0)
+
+            should_merge = False
+
+            if gap_minutes <= max_gap_minutes and gap_minutes >= 0:
+                # Short gap - check distances
+                if current_distance <= max_stop_distance or next_distance <= max_stop_distance:
+                    # At least one trip is very short - likely a false stop
+                    should_merge = True
+
+            if not should_merge:
+                break
+
+            # Merge the trips
+            merge_count += 1
+
+            # Track what was merged for transparency
+            if 'merged_from' not in current:
+                current['merged_from'] = [{
+                    'started': current['started'].strftime('%Y-%m-%d %H:%M'),
+                    'stopped': str(current.get('stopped', '')),
+                    'distance': current_distance,
+                    'start_address': current.get('start_address', ''),
+                    'end_address': current.get('end_address', '')
+                }]
+
+            current['merged_from'].append({
+                'started': next_trip['started'].strftime('%Y-%m-%d %H:%M'),
+                'stopped': str(next_trip.get('stopped', '')),
+                'distance': next_distance,
+                'start_address': next_trip.get('start_address', ''),
+                'end_address': next_trip.get('end_address', '')
+            })
+
+            # Update current trip with merged data
+            # Keep start from current, take end from next
+            current['stopped'] = next_trip.get('stopped', current.get('stopped'))
+            current['end_address'] = next_trip.get('end_address', current.get('end_address'))
+            current['end_odometer'] = next_trip.get('end_odometer', current.get('end_odometer'))
+            current['distance'] = current_distance + next_distance
+
+            # Mark as merged for display purposes
+            current['is_merged'] = True
+            current['merge_count'] = len(current['merged_from'])
+
+            i += 1  # Skip the merged trip
+
+        merged.append(current)
+        i += 1
+
+    return merged, merge_count
+
+
+def flag_micro_trips(trips, max_distance=0.15):
+    """
+    Flag micro-trips that are suspiciously short and likely GPS drift or parking adjustments.
+
+    Criteria for micro-trip:
+    - Distance is very small (< max_distance, default 0.15 miles)
+    - Start and end addresses are on the same street or very close
+
+    These are flagged but NOT removed - the user decides what to do with them.
+
+    Returns: (trips_with_flags, micro_count)
+    """
+    micro_count = 0
+
+    for trip in trips:
+        distance = trip.get('distance', 0)
+        start_addr = trip.get('start_address', '').lower()
+        end_addr = trip.get('end_address', '').lower()
+
+        is_micro = False
+
+        # Check if distance is very small
+        if distance <= max_distance:
+            # Check if addresses are similar (same street)
+            # Extract street name from addresses
+            start_parts = start_addr.replace(',', ' ').split()
+            end_parts = end_addr.replace(',', ' ').split()
+
+            # Look for common street identifiers
+            street_types = ['st', 'ave', 'rd', 'dr', 'ln', 'way', 'blvd', 'ct', 'pl', 'circle',
+                           'street', 'avenue', 'road', 'drive', 'lane', 'boulevard', 'court', 'place']
+
+            def extract_street(parts):
+                """Extract street name from address parts"""
+                for i, part in enumerate(parts):
+                    if part.lower().rstrip('.') in street_types and i > 0:
+                        # Return the part before the street type and the type
+                        return ' '.join(parts[max(0,i-2):i+1]).lower()
+                return ' '.join(parts[:3]).lower() if len(parts) >= 3 else ' '.join(parts).lower()
+
+            start_street = extract_street(start_parts)
+            end_street = extract_street(end_parts)
+
+            # If same street or very similar, it's likely a micro-trip
+            if start_street == end_street:
+                is_micro = True
+            elif distance <= 0.1:
+                # Very short distance - likely micro-trip regardless of street match
+                is_micro = True
+
+        if is_micro:
+            trip['is_micro_trip'] = True
+            trip['micro_reason'] = f"Very short trip ({distance:.2f} mi)"
+            if start_addr and end_addr:
+                # Check if essentially same location
+                if distance <= 0.05:
+                    trip['micro_reason'] = f"GPS drift or parking adjustment ({distance:.2f} mi)"
+            micro_count += 1
+        else:
+            trip['is_micro_trip'] = False
+
+    return trips, micro_count
+
 
 def read_trips(input_file):
     """Read trips from CSV or XLSX file"""
@@ -1316,11 +1536,10 @@ def analyze_mileage(csv_file, enable_lookup=False, start_date=None, end_date=Non
     print()
     sys.stdout.flush()  # Force output to appear immediately
 
-    # Load address cache and business mapping if lookup is enabled
+    # Load business mapping and config if lookup is enabled
     if enable_lookup:
-        print("Loading configuration and cache files...")
+        print("Loading configuration and mapping files...")
         sys.stdout.flush()
-        load_address_cache()
         load_business_mapping()
         load_config()
 
@@ -1433,9 +1652,9 @@ def analyze_mileage(csv_file, enable_lookup=False, start_date=None, end_date=Non
             print(f"  Processed {i + 1}/{len(trips)} trips...")
             sys.stdout.flush()
 
-    # Save the cache if we did any lookups
+    # Save the mapping if we did any lookups
     if enable_lookup:
-        save_address_cache()
+        save_business_mapping()
         print("Business lookup complete!\n")
         sys.stdout.flush()
 
@@ -1758,7 +1977,7 @@ def export_to_excel(categorized_trips, weekly_stats, total_commute, total_busine
         ws_detailed = wb.create_sheet("Detailed Trips")
         ws_detailed.append(['Date', 'Time', 'Day of Week', 'Category', 'Distance (miles)',
                           'Start Address', 'End Address', 'Business Name',
-                          'Start Odometer', 'End Odometer', 'Week Starting'])
+                          'Start Odometer', 'End Odometer', 'Week Starting', 'Notes'])
         format_header_row(ws_detailed)
 
         detailed_start_row = 2
@@ -1767,10 +1986,11 @@ def export_to_excel(categorized_trips, weekly_stats, total_commute, total_busine
             category = trip['auto_category'].title()
             business_name = trip['business_name'] if trip['auto_category'] in ['business', 'commute'] else ''
             week = get_week_key(trip['started'])
+            notes = trip.get('notes', '')  # Get notes if available
 
             ws_detailed.append([trip['started'], trip['started'], day_of_week, category, round(trip['distance'], 2),
                               trip['start_address'], trip['end_address'], business_name,
-                              trip['start_odometer'], trip['end_odometer'], week])
+                              trip['start_odometer'], trip['end_odometer'], week, notes])
 
         # Format date, time, and distance columns
         detailed_end_row = detailed_start_row + len(categorized_trips) - 1
@@ -1831,19 +2051,19 @@ def analyze_unresolved_addresses():
     print()
     sys.stdout.flush()
 
-    if not os.path.exists(ADDRESS_CACHE_FILE):
-        print("No address_cache.json found!")
-        print("Run the analysis with --lookup first to generate the cache.")
+    if not os.path.exists(BUSINESS_MAPPING_FILE):
+        print("No business_mapping.json found!")
+        print("Run the analysis with --lookup first to generate mappings.")
         return
 
-    # Load cache
-    load_address_cache()
+    # Load mapping
+    load_business_mapping()
 
     # Find all NO_BUSINESS_FOUND entries
-    unresolved = [addr for addr, value in address_lookup_cache.items() if value == "NO_BUSINESS_FOUND"]
-    resolved = {addr: value for addr, value in address_lookup_cache.items() if value != "NO_BUSINESS_FOUND"}
+    unresolved = [addr for addr in business_mapping.keys() if get_mapping_name(addr) == "NO_BUSINESS_FOUND"]
+    resolved = {addr: get_mapping_name(addr) for addr in business_mapping.keys() if get_mapping_name(addr) != "NO_BUSINESS_FOUND"}
 
-    print(f"Total addresses in cache: {len(address_lookup_cache)}")
+    print(f"Total addresses in mapping: {len(business_mapping)}")
     print(f"  - Resolved (with business names): {len(resolved)}")
     print(f"  - Unresolved (NO_BUSINESS_FOUND): {len(unresolved)}")
     print()
@@ -1853,9 +2073,6 @@ def analyze_unresolved_addresses():
         print("All addresses have been resolved!")
         print()
         return
-
-    # Load business mapping for saving
-    load_business_mapping()
 
     # === SMART AUTO-CATEGORIZATION ===
     print("-" * 80)
@@ -2348,19 +2565,10 @@ def analyze_unresolved_addresses():
         # Add home and office addresses first
         all_resolved[HOME_ADDRESS] = "Home"
         all_resolved[WORK_ADDRESS] = "Office"
-        # Add from address cache
-        if os.path.exists(ADDRESS_CACHE_FILE):
-            try:
-                with open(ADDRESS_CACHE_FILE, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                    for addr, info in cache.items():
-                        if isinstance(info, dict) and 'business_name' in info and info['business_name']:
-                            all_resolved[addr] = info['business_name']
-            except:
-                pass
-        # Add from business mapping
-        for addr, name in business_mapping.items():
-            if name and name != "[PERSONAL]":
+        # Add from business mapping (unified storage)
+        for addr in business_mapping.keys():
+            name = get_mapping_name(addr)
+            if name and name not in ["[PERSONAL]", "NO_BUSINESS_FOUND"]:
                 all_resolved[addr] = name
 
         # Edit addresses
