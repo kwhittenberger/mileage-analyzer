@@ -5,7 +5,7 @@ a = Analysis(
     ['mileage_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('config.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='NONE',
 )

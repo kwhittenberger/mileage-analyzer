@@ -1827,22 +1827,6 @@ class UnresolvedAddressesWidget(QWidget):
             except:
                 pass
 
-        # Load from address cache too
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                    for entry in cache.values():
-                        if isinstance(entry, dict):
-                            name = entry.get('name', '')
-                        else:
-                            name = str(entry)
-                        if name and name not in ['Home', 'Office', '[PERSONAL]', 'Unknown', '']:
-                            existing_names.add(name)
-            except:
-                pass
-
         # Add separator and existing names (sorted)
         if existing_names:
             self.location_combo.insertSeparator(self.location_combo.count())
@@ -2324,22 +2308,6 @@ class UnresolvedAddressesWidget(QWidget):
             except:
                 pass
 
-        # From address cache
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                    for entry in cache.values():
-                        if isinstance(entry, dict):
-                            name = entry.get('name', '')
-                        else:
-                            name = str(entry)
-                        if name and name not in skip_names:
-                            names.add(name)
-            except:
-                pass
-
         return names
 
     def _apply_name_to_selected(self, name: str):
@@ -2498,6 +2466,29 @@ class SettingsDialog(QDialog):
             "as commute (not tax-deductible business miles)."
         )
         addr_layout.addWidget(self.work_address)
+
+        # Spacer between address fields
+        addr_layout.addSpacing(10)
+
+        # Default state
+        state_label = QLabel("Default State:")
+        state_label.setStyleSheet("font-weight: normal; margin-bottom: 2px;")
+        state_label.setToolTip("State to append to addresses missing state info")
+        addr_layout.addWidget(state_label)
+
+        self.default_state = QLineEdit()
+        self.default_state.setPlaceholderText("e.g., WA")
+        self.default_state.setText(self.config.get('default_state', 'WA'))
+        self.default_state.setMaximumWidth(80)
+        self.default_state.setToolTip(
+            "Default state abbreviation for addresses.\n\n"
+            "Some vehicle data exports (like Volvo) don't include\n"
+            "state in addresses, which can cause map lookups to\n"
+            "find wrong locations across the country.\n\n"
+            "This state will be appended to addresses that don't\n"
+            "already contain a state abbreviation."
+        )
+        addr_layout.addWidget(self.default_state)
 
         scroll_layout.addWidget(addr_group)
 
@@ -2706,6 +2697,7 @@ class SettingsDialog(QDialog):
         if reply == QMessageBox.StandardButton.Yes:
             self.home_address.clear()
             self.work_address.clear()
+            self.default_state.setText('WA')
             self.api_key.clear()
             self.business_distance.setValue(8.0)
             self.merge_gap.setValue(3.0)
@@ -2718,6 +2710,7 @@ class SettingsDialog(QDialog):
         new_config = {
             'home_address': self.home_address.text().strip(),
             'work_address': self.work_address.text().strip(),
+            'default_state': self.default_state.text().strip().upper(),
             'google_places_api_key': self.api_key.text().strip(),
             'business_distance_threshold': self.business_distance.value(),
             'merge_gap_minutes': self.merge_gap.value(),
@@ -2793,6 +2786,74 @@ class NoteDialog(QDialog):
 
     def get_note(self) -> str:
         return self.text_edit.toPlainText()
+
+
+class EditAddressDialog(QDialog):
+    """Dialog for editing trip start and end addresses"""
+
+    def __init__(self, trip: dict, parent=None):
+        super().__init__(parent)
+        self.trip = trip
+        self.setWindowTitle("Edit Trip Address")
+        self.setMinimumWidth(500)
+
+        layout = QVBoxLayout(self)
+
+        # Trip info
+        time_str = trip.get('started', '')
+        if hasattr(time_str, 'strftime'):
+            time_str = time_str.strftime('%Y-%m-%d %H:%M')
+        info_label = QLabel(f"Trip: {time_str}")
+        info_label.setStyleSheet("color: #666; padding: 5px; background: #f5f5f5; border-radius: 3px;")
+        layout.addWidget(info_label)
+
+        layout.addSpacing(10)
+
+        # Start address
+        start_label = QLabel("Start Address:")
+        layout.addWidget(start_label)
+
+        self.start_address = QLineEdit()
+        self.start_address.setText(trip.get('start_address', ''))
+        self.start_address.setPlaceholderText("e.g., 123 Main St, Seattle, WA")
+        layout.addWidget(self.start_address)
+
+        layout.addSpacing(10)
+
+        # End address
+        end_label = QLabel("End Address (Destination):")
+        layout.addWidget(end_label)
+
+        self.end_address = QLineEdit()
+        self.end_address.setText(trip.get('end_address', ''))
+        self.end_address.setPlaceholderText("e.g., 456 Business Blvd, Bellevue, WA")
+        layout.addWidget(self.end_address)
+
+        # State hint
+        hint = QLabel("Tip: Include state abbreviation (e.g., WA) for accurate map lookups")
+        hint.setStyleSheet("color: #888; font-size: 11px; font-style: italic;")
+        layout.addWidget(hint)
+
+        layout.addSpacing(15)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.accept)
+        button_layout.addWidget(save_btn)
+
+        layout.addLayout(button_layout)
+
+    def get_addresses(self) -> tuple:
+        """Return (start_address, end_address)"""
+        return (self.start_address.text().strip(), self.end_address.text().strip())
 
 
 class JsonEditorDialog(QMainWindow):
@@ -4104,8 +4165,10 @@ class UnifiedTripView(QWidget):
 
         # Add/Edit Note (only for single trip)
         edit_note_action = None
+        edit_address_action = None
         if item_type == 'trip' and len(trips) == 1:
             edit_note_action = menu.addAction("Add/Edit Note...")
+            edit_address_action = menu.addAction("Edit Address...")
             menu.addSeparator()
 
         # Map actions
@@ -4132,13 +4195,36 @@ class UnifiedTripView(QWidget):
             self._apply_category_to_trips(trips, "COMMUTE")
         elif action == edit_note_action and trips:
             self._edit_note_for_trip(trips[0])
+        elif action == edit_address_action and trips:
+            self._edit_trip_address(trips[0])
         elif action == view_map_action and trips:
             self.trip_selected.emit(trips[0])
         elif action == show_day_action and trips:
             self.show_daily_journey.emit(trips)
 
-    def _apply_name_to_trips(self, trips: list, name: str):
-        """Apply business name directly to a list of trips"""
+    def _apply_name_to_trips(self, trips: list, name: str, prompt_for_address: bool = True):
+        """Apply business name directly to a list of trips
+
+        If the name is already mapped to another address, optionally offer to
+        update the trip's address to match.
+        """
+        # Check if this name is already mapped to an address
+        existing_address = None
+        if prompt_for_address and len(trips) == 1:
+            existing_address = self._find_address_for_business(name)
+            current_addr = trips[0].get('end_address', '')
+
+            if existing_address and existing_address.lower() != current_addr.lower():
+                reply = QMessageBox.question(
+                    self, "Update Address?",
+                    f"'{name}' is already associated with:\n\n{existing_address}\n\n"
+                    f"Current trip address:\n{current_addr}\n\n"
+                    f"Would you like to also update this trip's address to match?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    trips[0]['end_address'] = existing_address
+
         for trip in trips:
             trip['business_name'] = name
             addr = trip.get('end_address', '')
@@ -4147,6 +4233,23 @@ class UnifiedTripView(QWidget):
                 self._save_business_mapping(addr, name, cat)
         self.mapping_changed.emit()
         self._refresh_table()
+
+    def _find_address_for_business(self, name: str) -> str:
+        """Find an address already associated with a business name"""
+        mapping_file = os.path.join(get_app_dir(), 'business_mapping.json')
+        if os.path.exists(mapping_file):
+            try:
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    mappings = json.load(f)
+                    for addr, value in mappings.items():
+                        if isinstance(value, dict):
+                            if value.get('name', '').lower() == name.lower():
+                                return addr
+                        elif isinstance(value, str) and value.lower() == name.lower():
+                            return addr
+            except:
+                pass
+        return None
 
     def _prompt_custom_name_for_trips(self, trips: list):
         """Prompt for custom name for trips"""
@@ -4180,6 +4283,27 @@ class UnifiedTripView(QWidget):
                 self._refresh_table()
             else:
                 QMessageBox.warning(self, "Save Error", msg)
+
+    def _edit_trip_address(self, trip: dict):
+        """Edit the destination address for a trip"""
+        dialog = EditAddressDialog(trip, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            old_end_addr = trip.get('end_address', '')
+            new_start_addr, new_end_addr = dialog.get_addresses()
+
+            # Update the trip
+            if new_start_addr:
+                trip['start_address'] = new_start_addr
+            if new_end_addr:
+                trip['end_address'] = new_end_addr
+
+            # If end address changed, we may need to update business mapping
+            if new_end_addr and new_end_addr != old_end_addr:
+                # Clear business name if address changed significantly
+                trip['business_name'] = ''
+
+            self.mapping_changed.emit()
+            self._refresh_table()
 
     def _apply_filters(self):
         """Apply all filters to the table or tree"""
@@ -4674,7 +4798,28 @@ class UnifiedTripView(QWidget):
         """Apply business name to selected rows (data_indices are original data indices)
 
         If category is provided, it will be saved with the mapping for future use.
+        If the name is already mapped to an address and only one trip is selected,
+        offer to update the trip's address to match.
         """
+        # Check if we should offer to update address (single trip in individual mode)
+        if len(data_indices) == 1 and self.view_mode == "individual":
+            data_index = data_indices[0]
+            if data_index < len(self.trips_data):
+                trip = self.trips_data[data_index]
+                current_addr = trip.get('end_address', '')
+                existing_address = self._find_address_for_business(name)
+
+                if existing_address and existing_address.lower() != current_addr.lower():
+                    reply = QMessageBox.question(
+                        self, "Update Address?",
+                        f"'{name}' is already associated with:\n\n{existing_address}\n\n"
+                        f"Current trip address:\n{current_addr}\n\n"
+                        f"Would you like to also update this trip's address to match?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        trip['end_address'] = existing_address
+
         for data_index in data_indices:
             if self.view_mode == "grouped" and data_index < len(self.grouped_data):
                 data = self.grouped_data[data_index]
@@ -5346,22 +5491,6 @@ class TripTableWidget(QTableWidget):
             except:
                 pass
 
-        # From address cache
-        cache_file = os.path.join(get_app_dir(), 'address_cache.json')
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cache = json.load(f)
-                    for entry in cache.values():
-                        if isinstance(entry, dict):
-                            name = entry.get('name', '')
-                        else:
-                            name = str(entry)
-                        if name and name not in skip_names:
-                            names.add(name)
-            except:
-                pass
-
         return names
 
     def _update_trip_category(self, row: int, trip: dict, new_category: str):
@@ -5703,19 +5832,6 @@ class MileageAnalyzerGUI(QMainWindow):
             }
             QTreeWidget::item:hover:!selected {
                 background-color: #f5f5f5;
-            }
-            QTreeWidget::branch {
-                background: transparent;
-            }
-            QTreeWidget::branch:has-children:!has-siblings:closed,
-            QTreeWidget::branch:closed:has-children:has-siblings {
-                border-image: none;
-                image: none;
-            }
-            QTreeWidget::branch:open:has-children:!has-siblings,
-            QTreeWidget::branch:open:has-children:has-siblings {
-                border-image: none;
-                image: none;
             }
             /* Context menu styling */
             QMenu {

@@ -39,7 +39,17 @@ except ImportError:
 # Configuration - Key addresses (loaded from config.json)
 HOME_ADDRESS = "15815 61st Ln NE, Kenmore"  # Default
 WORK_ADDRESS = "9227 NE 180th St, Bothell"  # Default
+DEFAULT_STATE = "WA"  # Default state for addresses without state info
 COUPEVILLE_AREA = ["Coupeville", "Oak Harbor", "Clinton", "Whidbey"]
+
+# US state abbreviations for detecting if address has a state
+US_STATE_ABBREVS = {
+    'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+    'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+    'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+    'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+    'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC'
+}
 
 # Distance threshold for business trips (miles)
 BUSINESS_DISTANCE_THRESHOLD = 8.0
@@ -95,6 +105,35 @@ def is_spokane_area(address):
     norm = normalize_address(address)
     spokane_keywords = ["spokane", "spokane valley", "liberty lake"]
     return any(keyword in norm for keyword in spokane_keywords)
+
+def address_has_state(address):
+    """Check if address already contains a US state abbreviation"""
+    if not address:
+        return False
+    # Look for state abbreviation at end of address or before zip code
+    # Pattern: ", XX" or ", XX 12345" at end of address
+    parts = address.strip().split(',')
+    if len(parts) < 2:
+        return False
+    last_part = parts[-1].strip().upper()
+    # Check if it starts with a state abbreviation
+    words = last_part.split()
+    if words and words[0] in US_STATE_ABBREVS:
+        return True
+    return False
+
+def append_state_to_address(address, state=None):
+    """Append state to address if it doesn't already have one"""
+    if not address:
+        return address
+    if state is None:
+        state = DEFAULT_STATE
+    if not state:
+        return address
+    # Only append if address doesn't already have a state
+    if not address_has_state(address):
+        return f"{address.strip()}, {state.upper()}"
+    return address
 
 def extract_street_info(address):
     """Extract street number and street name from address"""
@@ -234,7 +273,7 @@ def set_mapping_entry(address: str, name: str, category: str = None, source: str
 
 def load_config():
     """Load configuration including Google API key and addresses"""
-    global google_api_key, gmaps_client, HOME_ADDRESS, WORK_ADDRESS
+    global google_api_key, gmaps_client, HOME_ADDRESS, WORK_ADDRESS, DEFAULT_STATE
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -252,6 +291,11 @@ def load_config():
                 work = config.get('work_address', '').strip()
                 if work:
                     WORK_ADDRESS = work
+
+                # Load default state for addresses
+                state = config.get('default_state', '').strip().upper()
+                if state:
+                    DEFAULT_STATE = state
         except:
             pass
 
@@ -997,10 +1041,10 @@ def read_trips_from_xlsx(xlsx_file):
                 trip = {
                     'started': started,
                     'start_odometer': get_val('Start odometer (miles)', 3),
-                    'start_address': get_val('Start address', 4),
+                    'start_address': append_state_to_address(get_val('Start address', 4)),
                     'stopped': get_val('Stopped', 5),
                     'end_odometer': get_val('End odometer (miles)', 6),
-                    'end_address': get_val('End address', 7),
+                    'end_address': append_state_to_address(get_val('End address', 7)),
                     'distance': distance,
                     'category': get_val('Category', 1),
                     'user_notes': get_val('User Notes', 14)
@@ -1049,10 +1093,10 @@ def read_trips_from_csv(csv_file):
                     trip = {
                         'started': started,
                         'start_odometer': row['Start odometer (miles)'].strip(),
-                        'start_address': row['Start address'].strip(),
+                        'start_address': append_state_to_address(row['Start address'].strip()),
                         'stopped': row['Stopped'].strip(),
                         'end_odometer': row['End odometer (miles)'].strip(),
-                        'end_address': row['End address'].strip(),
+                        'end_address': append_state_to_address(row['End address'].strip()),
                         'distance': distance,
                         'category': row['Category'].strip(),
                         'user_notes': row.get('User Notes', '').strip()
@@ -1083,10 +1127,10 @@ def read_trips_from_csv(csv_file):
                     trip = {
                         'started': started,
                         'start_odometer': row['Start odometer (miles)'].strip(),
-                        'start_address': row['Start address'].strip(),
+                        'start_address': append_state_to_address(row['Start address'].strip()),
                         'stopped': row['Stopped'].strip(),
                         'end_odometer': row['End odometer (miles)'].strip(),
-                        'end_address': row['End address'].strip(),
+                        'end_address': append_state_to_address(row['End address'].strip()),
                         'distance': distance,
                         'category': row['Category'].strip(),
                         'user_notes': row.get('User Notes', '').strip()
